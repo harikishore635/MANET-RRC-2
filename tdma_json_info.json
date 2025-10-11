@@ -1,0 +1,223 @@
+{
+  "title": "TDMA JSON Interface Specification", 
+  "description": "JSON format for RRC to TDMA/queue[1].c communication on ZCU104 A53/R5 bare metal",
+  "version": "1.0",
+  "platform": "ZCU104 Zynq UltraScale+",
+  "cores": ["A53 Application Processor", "R5 Real-time Processor"],
+
+  "communication_method": {
+    "options": [
+      "Direct function calls to queue[1].c",
+      "Shared memory circular buffer",
+      "Hardware FIFOs between A53/R5",
+      "Interrupt-driven message passing"
+    ],
+    "recommended": "Direct function integration with queue[1].c enqueue()"
+  },
+
+  "json_messages": {
+    "slot_request": {
+      "description": "RRC requests TDMA slot allocation for message transmission",
+      "format": {
+        "type": "slot_request",
+        "priority": 0,
+        "priority_desc": "digital_voice|analog_voice_ptt|video_stream|file_transfer|sms|relay",
+        "source_node": 254,
+        "dest_node": 1,
+        "payload_size": 16,
+        "transmission_type": "unicast|broadcast|multicast",
+        "preemption_allowed": true,
+        "timestamp": 1697875200,
+        "request_id": 12345,
+        "next_hop_node": 2,
+        "data_type": 1,
+        "urgency_level": "immediate|high|normal|low"
+      },
+      "queue_mapping": {
+        "-1": "analog_voice_queue (immediate transmission)",
+        "0": "data_queues[0] (digital voice - continuous slots)",
+        "1": "data_queues[1] (video - burst slots)",
+        "2": "data_queues[2] (file - background slots)",
+        "3": "data_queues[3] (SMS - opportunistic slots)",
+        "4": "rx_relay_queue (lowest priority)"
+      }
+    },
+
+    "frame_data": {
+      "description": "RRC sends actual frame data for TDMA transmission",
+      "format": {
+        "type": "frame_data",
+        "source_node": 254,
+        "dest_node": 1,
+        "slot_number": 15,
+        "frame_number": 42,
+        "payload_size": 16,
+        "payload_data": "48656C6C6F576F726C64",
+        "checksum": "0xA5B3",
+        "timestamp": 1697875200,
+        "next_hop": 2,
+        "final_destination": 1,
+        "ttl": 10
+      },
+      "encoding": {
+        "payload_data": "Hexadecimal encoded bytes (max 16 bytes)",
+        "checksum": "CRC16 or simple XOR checksum",
+        "frame_format": "Compatible with queue[1].c frame structure"
+      }
+    },
+
+    "slot_assignment": {
+      "description": "TDMA scheduler responds with slot allocation",
+      "format": {
+        "type": "slot_assignment", 
+        "source_node": 254,
+        "dest_node": 1,
+        "slot_number": 15,
+        "frame_number": 42,
+        "priority": 0,
+        "transmission_window": {
+          "start_time": 1500,
+          "duration": 200,
+          "slot_offset": 15
+        },
+        "status": "assigned|queued|rejected|preempted",
+        "queue_position": 3,
+        "estimated_delay": 50
+      }
+    },
+
+    "schedule_update": {
+      "description": "TDMA schedule changes notification",
+      "format": {
+        "type": "schedule_update",
+        "frame_number": 43,
+        "total_slots": 100,
+        "slot_duration_us": 1000,
+        "frame_duration_ms": 100,
+        "active_nodes": [254, 1, 2, 3, 4],
+        "slot_allocations": [
+          {"node": 254, "slots": [1, 15, 30, 45]},
+          {"node": 1, "slots": [5, 20, 35, 50]},
+          {"node": 2, "slots": [10, 25, 40, 55]}
+        ],
+        "emergency_slots": [99, 98, 97]
+      }
+    }
+  },
+
+  "priority_to_tdma_mapping": {
+    "PRIORITY_ANALOG_VOICE_PTT (-1)": {
+      "queue": "analog_voice_queue",
+      "behavior": "Immediate preemption of any current transmission",
+      "slot_type": "Emergency/interrupting",
+      "max_delay_ms": 0
+    },
+    "PRIORITY_DIGITAL_VOICE (0)": {
+      "queue": "data_queues[0]", 
+      "behavior": "Continuous slot allocation for voice stream",
+      "slot_type": "Periodic/guaranteed",
+      "max_delay_ms": 20
+    },
+    "PRIORITY_VIDEO (1)": {
+      "queue": "data_queues[1]",
+      "behavior": "Burst slot allocation for video frames", 
+      "slot_type": "Burst/adaptive",
+      "max_delay_ms": 100
+    },
+    "PRIORITY_FILE (2)": {
+      "queue": "data_queues[2]",
+      "behavior": "Background transmission when slots available",
+      "slot_type": "Best-effort/background", 
+      "max_delay_ms": 1000
+    },
+    "PRIORITY_SMS (3)": {
+      "queue": "data_queues[3]",
+      "behavior": "Opportunistic transmission",
+      "slot_type": "Opportunistic/low-priority",
+      "max_delay_ms": 5000
+    },
+    "PRIORITY_RX_RELAY (4)": {
+      "queue": "rx_relay_queue",
+      "behavior": "Lowest priority relay forwarding",
+      "slot_type": "Background/relay",
+      "max_delay_ms": 10000
+    }
+  },
+
+  "transmission_types": {
+    "unicast": {
+      "description": "Point-to-point transmission to specific node",
+      "slot_requirement": "Single slot to next hop",
+      "collision_domain": "Minimal - only next hop needs to listen"
+    },
+    "broadcast": {
+      "description": "Transmission to all neighbors",
+      "slot_requirement": "Multiple slots or higher power",
+      "collision_domain": "All neighbors must receive"
+    },
+    "multicast": {
+      "description": "Transmission to selected group of nodes",
+      "slot_requirement": "Selective slot allocation",
+      "collision_domain": "Group members only"
+    }
+  },
+
+  "frame_structure": {
+    "max_payload_bytes": 16,
+    "node_address_size": 1,
+    "header_fields": [
+      "source_node (1 byte)",
+      "dest_node (1 byte)", 
+      "next_hop (1 byte)",
+      "data_type (1 byte)",
+      "priority (1 byte)",
+      "payload_size (1 byte)",
+      "checksum (2 bytes)"
+    ],
+    "total_frame_size": "Header (8 bytes) + Payload (16 bytes) = 24 bytes max"
+  },
+
+  "timing_constraints": {
+    "slot_duration_us": 1000,
+    "frame_duration_ms": 100,
+    "guard_time_us": 50,
+    "max_slots_per_frame": 100,
+    "ptt_preemption_time_us": 10,
+    "sync_overhead_us": 100
+  },
+
+  "implementation_notes": {
+    "queue_integration": "Direct calls to enqueue() function in queue[1].c",
+    "memory_constraints": "16-byte payload limit for embedded systems",
+    "real_time_requirements": "PTT must preempt within 10 microseconds",
+    "synchronization": "Use hardware timers for TDMA slot synchronization",
+    "error_handling": "Implement timeout and retry mechanisms"
+  },
+
+  "sample_integration": {
+    "function_call": "int enqueue(struct queue* target_queue, struct frame* frame_data);",
+    "queue_selection": "struct queue* get_priority_queue(int priority_level);",
+    "frame_creation": "struct frame* create_frame_from_json(const char* json_message);"
+  },
+
+  "zcu104_specific": {
+    "a53_responsibilities": [
+      "JSON parsing and validation",
+      "Priority queue management", 
+      "Interface with OLSR routing",
+      "Application layer communication"
+    ],
+    "r5_responsibilities": [
+      "Real-time TDMA slot timing",
+      "Hardware timer management",
+      "Physical layer interface",
+      "Interrupt handling for PTT"
+    ],
+    "shared_resources": [
+      "DDR4 memory for message buffers",
+      "OCM for fast inter-processor communication",
+      "Hardware timers for synchronization",
+      "GPIO for PTT interrupt detection"
+    ]
+  }
+}
