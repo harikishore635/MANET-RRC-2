@@ -2293,6 +2293,649 @@ void print_relay_stats(void) {
 }
 
 // ============================================================================
+// PRIORITY-BASED NC SLOT ALLOCATION SYSTEM
+// ============================================================================
+
+// Calculate comprehensive priority score (lower = higher priority)
+static uint32_t calculate_priority_score(const NCReservationRequest *request) {
+    if (!request) return 0xFFFFFFFF;
+    
+    uint32_t score = 0;
+    
+    if (request->isSelfReservation) {
+        score = 1000; // Highest priority for self
+    } else {
+        if (request->hopCount <= 2) {
+            score = 2000 + (request->hopCount * 100);
+        } else {
+            score = 2000 + (request->hopCount * 200);
+        }
+    }
+    
+    if (request->packetCount > 0) {
+        score -= (request->packetCount > 10) ? 10 : request->packetCount;
+    }
+    
+    score += (request->timestamp % 100);
+    
+    return score;
+}
+
+// Priority comparison function for qsort
+static int compare_nc_reservations(const void *a, const void *b) {
+    const NCReservationRequest *req_a = (const NCReservationRequest *)a;
+    const NCReservationRequest *req_b = (const NCReservationRequest *)b;
+    
+    uint32_t score_a = calculate_priority_score(req_a);
+    uint32_t score_b = calculate_priority_score(req_b);
+    
+    if (score_a < score_b) return -1;
+    if (score_a > score_b) return 1;
+    return 0;
+}
+
+// Add or update NC reservation
+bool rrc_add_nc_reservation(uint16_t nodeID, uint8_t hopCount, bool isSelf,
+                            uint8_t trafficType, uint32_t packetCount) {
+    if (reservation_count >= MAX_MONITORED_NODES) {
+        printf("RRC PRIORITY: Reservation queue full\n");
+        return false;
+    }
+    
+    // Update existing reservation
+    for (int i = 0; i < reservation_count; i++) {
+        if (reservation_queue[i].nodeID == nodeID) {
+            reservation_queue[i].hopCount = (hopCount < reservation_queue[i].hopCount) ? 
+                                            hopCount : reservation_queue[i].hopCount;
+            reservation_queue[i].isSelfReservation = isSelf;
+            reservation_queue[i].trafficType = trafficType;
+            reservation_queue[i].timestamp = (uint32_t)time(NULL);
+            reservation_queue[i].packetCount += packetCount;
+            
+            printf("RRC PRIORITY: Updated reservation node %u (hops:%u, packets:%u)\n",
+                   nodeID, reservation_queue[i].hopCount, reservation_queue[i].packetCount);
+            return true;
+        }
+    }
+    
+    // Add new reservation
+    NCReservationRequest *new_req = &reservation_queue[reservation_count];
+    new_req->nodeID = nodeID;
+    new_req->hopCount = hopCount;
+    new_req->isSelfReservation = isSelf;
+    new_req->trafficType = trafficType;
+    new_req->timestamp = (uint32_t)time(NULL);
+    new_req->packetCount = packetCount;
+    
+    reservation_count++;
+    
+    printf("RRC PRIORITY: Added reservation node %u (hops:%u, packets:%u)\n",
+           nodeID, hopCount, packetCount);
+    
+    return true;
+}
+
+// Check if we can override slot by priority
+static bool rrc_can_assign_nc_slot_by_priority(uint8_t slot, uint32_t my_priority_score, 
+                                                uint16_t my_node_id) {
+    if (slot == 0 || slot > NC_SLOTS_PER_SUPERCYCLE) return false;
+    
+    for (int i = 0; i < rrc_neighbors.neighbor_count; i++) {
+        if (rrc_neighbors.neighbor_table[i].active && 
+            rrc_neighbors.neighbor_table[i].assignedNCSlot == slot) {
+            
+            if (rrc_neighbors.neighbor_table[i].nodeID == my_node_id) return true;
+            
+            uint32_t owner_priority_score = 0xFFFFFFFF;
+            for (int j = 0; j < reservation_count; j++) {
+                if (reservation_queue[j].nodeID == rrc_neighbors.neighbor_table[i].nodeID) {
+                    owner_priority_score = calculate_priority_score(&reservation_queue[j]);
+                    break;
+                }
+            }
+            
+            return (my_priority_score < owner_priority_score);
+        }
+    }
+    
+    return true;
+}
+
+// Override NC slot from lower priority
+static void rrc_assign_priority_nc_slot(uint8_t slot, uint16_t new_owner) {
+    for (int i = 0; i < rrc_neighbors.neighbor_count; i++) {
+        if (rrc_neighbors.neighbor_table[i].active && 
+            rrc_neighbors.neighbor_table[i].assignedNCSlot == slot) {
+            
+            printf("RRC PRIORITY: Reassigning slot %u from node %u to %u\n",
+                   slot, rrc_neighbors.neighbor_table[i].nodeID, new_owner);
+            
+            rrc_neighbors.neighbor_table[i].assignedNCSlot = 0;
+            
+            if (rrc_neighbors.neighbor_table[i].nodeID == rrc_node_id) {
+                printf("RRC PRIORITY: Our slot %u reassigned to higher priority\n", slot);
+            }
+            break;
+        }
+    }
+    
+    rrc_update_nc_status_bitmap(slot, false);
+}
+
+// Assign NC slot based on priority
+static uint8_t rrc_assign_nc_slot_by_priority(const NCReservationRequest *request) {
+    if (!request) return 0;
+    
+    uint32_t my_priority_score = calculate_priority_score(request);
+    
+    uint32_t epoch = (uint32_t)time(NULL);
+    const int MAX_TRIES = 16;
+    
+    for (int t = 0; t < MAX_TRIES; t++) {
+        uint32_t priority_weight = (0xFFFFFFFF - my_priority_score) / 1000000;
+        uint32_t k = ((uint32_t)request->nodeID << 16) ^ epoch ^ 
+                     ((uint32_t)t * 0x9e3779b1u) ^ priority_weight;
+        
+        k = (k ^ (k >> 16)) * 0x45d9f3b;
+        k = (k ^ (k >> 16)) * 0x45d9f3b;
+        k = k ^ (k >> 16);
+        
+        uint8_t slot_range = NC_SLOTS_PER_SUPERCYCLE;
+        uint8_t slot_offset = 0;
+        
+        if (request->isSelfReservation) {
+            slot_range = NC_SLOTS_PER_SUPERCYCLE;
+            slot_offset = 0;
+        } else if (request->hopCount <= 2) {
+            slot_range = (NC_SLOTS_PER_SUPERCYCLE * 2) / 3;
+            slot_offset = 0;
+        } else {
+            slot_range = (NC_SLOTS_PER_SUPERCYCLE * 2) / 3;
+            slot_offset = NC_SLOTS_PER_SUPERCYCLE / 3;
+        }
+        
+        uint8_t slot = (uint8_t)(((k % slot_range) + slot_offset) + 1);
+        if (slot > NC_SLOTS_PER_SUPERCYCLE) 
+            slot = (slot % NC_SLOTS_PER_SUPERCYCLE) + 1;
+        
+        if (!rrc_is_nc_slot_conflicted(slot, request->nodeID)) {
+            rrc_update_nc_status_bitmap(slot, true);
+            return slot;
+        }
+        
+        if (rrc_can_assign_nc_slot_by_priority(slot, my_priority_score, request->nodeID)) {
+            rrc_assign_priority_nc_slot(slot, request->nodeID);
+            rrc_update_nc_status_bitmap(slot, true);
+            return slot;
+        }
+    }
+    
+    for (uint8_t slot = 1; slot <= NC_SLOTS_PER_SUPERCYCLE; slot++) {
+        if (!rrc_is_nc_slot_conflicted(slot, request->nodeID)) {
+            rrc_update_nc_status_bitmap(slot, true);
+            return slot;
+        }
+    }
+    
+    return 0;
+}
+
+void rrc_process_nc_reservations_by_priority(void) {
+    if (reservation_count == 0) return;
+    
+    printf("RRC PRIORITY: Processing %d reservations\n", reservation_count);
+    
+    qsort(reservation_queue, reservation_count, sizeof(NCReservationRequest), 
+          compare_nc_reservations);
+    
+    for (int i = 0; i < reservation_count; i++) {
+        NCReservationRequest *req = &reservation_queue[i];
+        uint32_t priority_score = calculate_priority_score(req);
+        
+        const char *priority_type = req->isSelfReservation ? "SELF" : 
+                                   (req->hopCount <= 2 ? "SHORT_HOP" : "LONG_HOP");
+        
+        printf("RRC PRIORITY: [%d] Node %u - Score:%u, Type:%s, Hops:%u, Packets:%u\n",
+               i + 1, req->nodeID, priority_score, priority_type, 
+               req->hopCount, req->packetCount);
+        
+        uint8_t assigned_slot = rrc_assign_nc_slot_by_priority(req);
+        if (assigned_slot != 0) {
+            printf("RRC PRIORITY: ✅ Assigned slot %u to node %u\n", 
+                   assigned_slot, req->nodeID);
+            
+            NeighborState *neighbor = rrc_get_neighbor_state(req->nodeID);
+            if (!neighbor) neighbor = rrc_create_neighbor_state(req->nodeID);
+            if (neighbor) neighbor->assignedNCSlot = assigned_slot;
+        } else {
+            printf("RRC PRIORITY: ❌ Failed to assign slot to node %u\n", req->nodeID);
+        }
+    }
+}
+
+int rrc_request_nc_reservation_multi_relay(uint16_t dest_node, uint8_t traffic_type,
+                                           bool urgent, uint32_t packet_count) {
+    uint8_t next_hop = ipc_olsr_get_next_hop(dest_node);
+    uint8_t hop_count = 1;
+    
+    if (next_hop == 0 || next_hop == 0xFF) {
+        printf("RRC PRIORITY: No route to %u, triggering discovery\n", dest_node);
+        ipc_olsr_trigger_route_discovery(dest_node);
+        hop_count = 255;
+    } else if (next_hop != dest_node) {
+        hop_count = 2;
+    }
+    
+    bool is_self = (dest_node == rrc_node_id);
+    
+    if (rrc_add_nc_reservation(dest_node, hop_count, is_self, traffic_type, packet_count)) {
+        printf("RRC PRIORITY: Multi-relay reservation - Dest:%u, Hops:%u, Self:%s, Packets:%u\n",
+               dest_node, hop_count, is_self ? "YES" : "NO", packet_count);
+        return 0;
+    }
+    
+    return -1;
+}
+
+void rrc_cleanup_nc_reservations(void) {
+    uint32_t current_time = (uint32_t)time(NULL);
+    const uint32_t RESERVATION_TIMEOUT = 30;
+    
+    int write_index = 0;
+    for (int read_index = 0; read_index < reservation_count; read_index++) {
+        NCReservationRequest *req = &reservation_queue[read_index];
+        uint32_t age = current_time - req->timestamp;
+        
+        if (age <= RESERVATION_TIMEOUT) {
+            if (write_index != read_index)
+                reservation_queue[write_index] = *req;
+            write_index++;
+        } else {
+            printf("RRC PRIORITY: Removing expired reservation node %u (age:%u sec)\n",
+                   req->nodeID, age);
+        }
+    }
+    
+    reservation_count = write_index;
+}
+
+uint8_t rrc_assign_nc_slot_with_multi_relay_priority(uint16_t nodeID, uint32_t packet_count) {
+    bool is_self = (nodeID == rrc_node_id);
+    uint8_t traffic_type = 3;
+    uint8_t hop_count = is_self ? 0 : 1;
+    
+    if (!is_self) {
+        uint8_t next_hop = ipc_olsr_get_next_hop(nodeID);
+        if (next_hop == 0 || next_hop == 0xFF) {
+            hop_count = 255;
+        } else if (next_hop != nodeID) {
+            hop_count = 2;
+        }
+    }
+    
+    rrc_add_nc_reservation(nodeID, hop_count, is_self, traffic_type, packet_count);
+    rrc_process_nc_reservations_by_priority();
+    rrc_cleanup_nc_reservations();
+    
+    NeighborState *neighbor = rrc_get_neighbor_state(nodeID);
+    if (neighbor && neighbor->assignedNCSlot != 0) {
+        return neighbor->assignedNCSlot;
+    }
+    
+    return rrc_assign_nc_slot(nodeID);
+}
+
+void print_nc_reservation_priority_status(void) {
+    printf("\n=== NC Reservation Priority Status ===\n");
+    printf("Active reservations: %d\n", reservation_count);
+    printf("Node | Hops | Self | Traffic | Packets | Score  | Type      | Age(s)\n");
+    printf("-----|------|------|---------|---------|--------|-----------|-------\n");
+    
+    uint32_t current_time = (uint32_t)time(NULL);
+    
+    for (int i = 0; i < reservation_count; i++) {
+        NCReservationRequest *req = &reservation_queue[i];
+        uint32_t priority_score = calculate_priority_score(req);
+        uint32_t age = current_time - req->timestamp;
+        
+        const char *priority_type = req->isSelfReservation ? "SELF" : 
+                                   (req->hopCount <= 2 ? "SHORT_HOP" : "LONG_HOP");
+        
+        printf(" %3u | %4u | %4s | %7u | %7u | %6u | %-9s | %5u\n",
+               req->nodeID, req->hopCount,
+               req->isSelfReservation ? "YES" : "NO",
+               req->trafficType, req->packetCount, priority_score,
+               priority_type, age);
+    }
+    
+    printf("===========================================\n\n");
+}
+
+// ============================================================================
+// TDMA TRANSFER/RECEIVE CONTROL
+// ============================================================================
+
+int rrc_request_transmit_slot(uint8_t dest_node, MessagePriority priority) {
+    if (!ipc_tdma_check_slot_available(dest_node, priority)) {
+        printf("RRC-TDMA: No available slots for dest %u (priority %d)\n", dest_node, priority);
+        return -1;
+    }
+    
+    printf("RRC-TDMA: Transmit slot available for dest %u\n", dest_node);
+    return 0;
+}
+
+int rrc_confirm_transmit_slot(uint8_t dest_node, uint8_t slot_id) {
+    for (int i = 0; i < RRC_DU_GU_SLOT_COUNT; i++) {
+        if (!rrc_slot_allocation[i].allocated && rrc_slot_allocation[i].slot_id == slot_id) {
+            rrc_slot_allocation[i].allocated = true;
+            rrc_slot_allocation[i].dest_node = dest_node;
+            rrc_slot_allocation[i].last_used_time = (uint32_t)time(NULL);
+            
+            printf("RRC-TDMA: Confirmed transmit slot %u for dest %u\n", slot_id, dest_node);
+            rrc_slot_stats.slots_allocated++;
+            return 0;
+        }
+    }
+    
+    printf("RRC-TDMA: Failed to confirm slot %u\n", slot_id);
+    return -1;
+}
+
+void rrc_release_transmit_slot(uint8_t dest_node, uint8_t slot_id) {
+    for (int i = 0; i < RRC_DU_GU_SLOT_COUNT; i++) {
+        if (rrc_slot_allocation[i].allocated && 
+            rrc_slot_allocation[i].slot_id == slot_id &&
+            rrc_slot_allocation[i].dest_node == dest_node) {
+            
+            rrc_slot_allocation[i].allocated = false;
+            rrc_slot_allocation[i].dest_node = 0;
+            
+            printf("RRC-TDMA: Released transmit slot %u for dest %u\n", slot_id, dest_node);
+            rrc_slot_stats.slots_released++;
+            return;
+        }
+    }
+}
+
+int rrc_setup_receive_slot(uint8_t source_node) {
+    printf("RRC-TDMA: Setting up receive slot for source %u\n", source_node);
+    
+    NeighborState *neighbor = rrc_create_neighbor_state(source_node);
+    if (!neighbor) {
+        printf("RRC-TDMA: Failed to create neighbor state for source %u\n", source_node);
+        return -1;
+    }
+    
+    neighbor->active = true;
+    neighbor->lastHeardTime = (uint64_t)time(NULL);
+    
+    return 0;
+}
+
+void rrc_handle_received_frame(struct frame *received_frame) {
+    if (!received_frame) return;
+    
+    printf("RRC-TDMA: Handling received frame - src:%u, dest:%u, TTL:%d\n",
+           received_frame->source_add, received_frame->dest_add, received_frame->TTL);
+    
+    if (received_frame->dest_add == rrc_node_id) {
+        printf("RRC-TDMA: Frame is for us, processing...\n");
+        rrc_process_uplink_frame(received_frame);
+    } else if (should_relay_packet(received_frame)) {
+        printf("RRC-TDMA: Relaying frame to dest %u\n", received_frame->dest_add);
+        enqueue_relay_packet(received_frame);
+    }
+    
+    rrc_update_connection_activity(received_frame->source_add);
+}
+
+void rrc_cleanup_receive_resources(uint8_t source_node) {
+    printf("RRC-TDMA: Cleaning up receive resources for source %u\n", source_node);
+    
+    NeighborState *neighbor = rrc_get_neighbor_state(source_node);
+    if (neighbor) {
+        neighbor->active = false;
+    }
+}
+
+// ============================================================================
+// UPLINK PROCESSING
+// ============================================================================
+
+int rrc_process_uplink_frame(struct frame *received_frame) {
+    if (!received_frame) return -1;
+    
+    printf("RRC-UPLINK: Processing frame - type:%d, src:%u, dest:%u\n",
+           received_frame->data_type, received_frame->source_add, 
+           received_frame->dest_add);
+    
+    if (received_frame->rx_or_l3) {
+        // OLSR/L3 packet
+        return forward_olsr_packet_to_l3(received_frame);
+    } else {
+        // Application data
+        return deliver_data_packet_to_l7(received_frame);
+    }
+}
+
+int forward_olsr_packet_to_l3(struct frame *l3_frame) {
+    if (!l3_frame) return -1;
+    
+    printf("RRC-UPLINK: Forwarding OLSR packet to L3 (src:%u)\n", l3_frame->source_add);
+    
+    // Build IPC message for OLSR
+    IPC_Message olsr_msg;
+    olsr_msg.type = MSG_OLSR_MESSAGE;
+    
+    // Would parse actual OLSR message here
+    // For now, just notify OLSR of received packet
+    
+    if (rrc_send_to_olsr(&olsr_msg) == 0) {
+        printf("RRC-UPLINK: OLSR packet forwarded successfully\n");
+        return 0;
+    }
+    
+    return -1;
+}
+
+int deliver_data_packet_to_l7(struct frame *app_frame) {
+    if (!app_frame) return -1;
+    
+    printf("RRC-UPLINK: Delivering data to L7 (src:%u, size:%u)\n",
+           app_frame->source_add, app_frame->payload_length_bytes);
+    
+    CustomApplicationPacket *app_pkt = convert_frame_to_app_packet(app_frame);
+    if (!app_pkt) {
+        printf("RRC-UPLINK: Failed to convert frame to app packet\n");
+        return -1;
+    }
+    
+    int result = rrc_deliver_to_application_layer(app_pkt);
+    release_app_packet(app_pkt);
+    
+    return result;
+}
+
+int rrc_deliver_to_application_layer(const CustomApplicationPacket *packet) {
+    if (!packet) return -1;
+    
+    if (rrc_send_to_app(packet) == 0) {
+        printf("RRC-UPLINK: Packet delivered to application (src:%u)\n", packet->src_id);
+        notify_successful_delivery(packet->src_id, packet->sequence_number);
+        return 0;
+    }
+    
+    printf("RRC-UPLINK: Failed to deliver packet to application\n");
+    notify_application_of_failure(packet->src_id, "Queue full");
+    return -1;
+}
+
+CustomApplicationPacket *convert_frame_to_app_packet(const struct frame *frame) {
+    if (!frame) return NULL;
+    
+    CustomApplicationPacket *app_pkt = get_free_app_packet();
+    if (!app_pkt) return NULL;
+    
+    app_pkt->src_id = frame->source_add;
+    app_pkt->dest_id = frame->dest_add;
+    app_pkt->data_type = (RRC_DataType)frame->data_type;
+    app_pkt->transmission_type = TRANSMISSION_UNICAST;
+    app_pkt->data_size = frame->payload_length_bytes;
+    memcpy(app_pkt->data, frame->payload, frame->payload_length_bytes);
+    app_pkt->timestamp = (uint32_t)time(NULL);
+    app_pkt->sequence_number = 0; // Frame doesn't have sequence number
+    app_pkt->urgent = (frame->priority == 1);
+    
+    return app_pkt;
+}
+
+void generate_slot_assignment_failure_message(uint8_t node_id) {
+    printf("RRC-UPLINK: Slot assignment failed for node %u\n", node_id);
+    
+    CustomApplicationPacket failure_pkt;
+    memset(&failure_pkt, 0, sizeof(failure_pkt));
+    
+    failure_pkt.src_id = rrc_node_id;
+    failure_pkt.dest_id = node_id;
+    failure_pkt.data_type = RRC_DATA_TYPE_CONTROL;
+    failure_pkt.transmission_type = TRANSMISSION_UNICAST;
+    snprintf((char*)failure_pkt.data, sizeof(failure_pkt.data), 
+             "Slot assignment failed");
+    failure_pkt.data_size = strlen((char*)failure_pkt.data);
+    failure_pkt.timestamp = (uint32_t)time(NULL);
+    
+    rrc_send_to_app(&failure_pkt);
+}
+
+// ============================================================================
+// APPLICATION FEEDBACK
+// ============================================================================
+
+void notify_application_of_failure(uint8_t dest_node, const char *reason) {
+    printf("RRC-APP: Notifying failure - dest:%u, reason:%s\n", dest_node, reason);
+    
+    CustomApplicationPacket failure_pkt;
+    memset(&failure_pkt, 0, sizeof(failure_pkt));
+    
+    failure_pkt.src_id = rrc_node_id;
+    failure_pkt.dest_id = dest_node;
+    failure_pkt.data_type = RRC_DATA_TYPE_CONTROL;
+    failure_pkt.transmission_type = TRANSMISSION_UNICAST;
+    snprintf((char*)failure_pkt.data, sizeof(failure_pkt.data), 
+             "DELIVERY_FAILED: %s", reason ? reason : "Unknown");
+    failure_pkt.data_size = strlen((char*)failure_pkt.data);
+    failure_pkt.timestamp = (uint32_t)time(NULL);
+    
+    rrc_send_to_app(&failure_pkt);
+}
+
+void notify_successful_delivery(uint8_t dest_node, uint32_t sequence_number) {
+    printf("RRC-APP: Delivery success - dest:%u, seq:%u\n", dest_node, sequence_number);
+    
+    rrc_stats.messages_enqueued_total++;
+}
+
+// ============================================================================
+// PIGGYBACK SUPPORT EXTENSIONS
+// ============================================================================
+
+void rrc_initialize_piggyback_system(void) {
+    piggyback_active = false;
+    piggyback_last_update = 0;
+    
+    rrc_init_piggyback_tlv();
+    
+    printf("RRC-PIGGYBACK: System initialized\n");
+}
+
+void rrc_initialize_piggyback(uint8_t node_id, uint8_t session_id, 
+                              uint8_t traffic_type, uint8_t reserved_slot) {
+    rrc_neighbors.current_piggyback_tlv.sourceNodeID = node_id;
+    rrc_neighbors.current_piggyback_tlv.myNCSlot = reserved_slot;
+    rrc_neighbors.current_piggyback_tlv.ttl = 10;
+    rrc_neighbors.current_piggyback_tlv.timeSync = (uint32_t)time(NULL);
+    
+    piggyback_active = true;
+    piggyback_last_update = (uint32_t)time(NULL);
+    
+    printf("RRC-PIGGYBACK: Initialized - node:%u, session:%u, slot:%u\n",
+           node_id, session_id, reserved_slot);
+}
+
+void rrc_clear_piggyback(void) {
+    piggyback_active = false;
+    rrc_neighbors.current_piggyback_tlv.ttl = 0;
+    
+    printf("RRC-PIGGYBACK: Cleared\n");
+}
+
+bool rrc_should_attach_piggyback(void) {
+    if (!piggyback_active) return false;
+    if (rrc_neighbors.current_piggyback_tlv.ttl == 0) return false;
+    
+    uint32_t age = (uint32_t)time(NULL) - piggyback_last_update;
+    return (age < 5); // Active if updated within 5 seconds
+}
+
+PiggybackTLV *rrc_get_piggyback_data(void) {
+    if (!rrc_should_attach_piggyback()) return NULL;
+    
+    return &rrc_neighbors.current_piggyback_tlv;
+}
+
+void rrc_check_start_end_packets(const CustomApplicationPacket *packet) {
+    if (!packet) return;
+    
+    // Check if this is START packet (initialize piggyback)
+    if (packet->data_size > 0 && strncmp((char*)packet->data, "START", 5) == 0) {
+        uint8_t nc_slot = rrc_get_my_nc_slot();
+        rrc_initialize_piggyback(packet->src_id, packet->sequence_number, 
+                                packet->data_type, nc_slot);
+        printf("RRC-PIGGYBACK: START detected, piggyback activated\n");
+    }
+    
+    // Check if this is END packet (clear piggyback)
+    if (packet->data_size > 0 && strncmp((char*)packet->data, "END", 3) == 0) {
+        rrc_clear_piggyback();
+        printf("RRC-PIGGYBACK: END detected, piggyback cleared\n");
+    }
+}
+
+// ============================================================================
+// SLOT SCHEDULING SUPPORT
+// ============================================================================
+
+void rrc_update_nc_schedule(void) {
+    // Update NC schedule based on current supercycle
+    uint32_t current_time = (uint32_t)time(NULL);
+    
+    for (int i = 0; i < rrc_neighbors.neighbor_count; i++) {
+        if (rrc_neighbors.neighbor_table[i].active) {
+            uint64_t age = current_time - rrc_neighbors.neighbor_table[i].lastHeardTime;
+            
+            // Remove inactive neighbors
+            if (age > NEIGHBOR_TIMEOUT_SUPERCYCLES * 20) {
+                printf("RRC-SCHEDULE: Removing inactive neighbor %u\n",
+                       rrc_neighbors.neighbor_table[i].nodeID);
+                rrc_neighbors.neighbor_table[i].active = false;
+                
+                uint8_t old_slot = rrc_neighbors.neighbor_table[i].assignedNCSlot;
+                if (old_slot > 0) {
+                    rrc_update_nc_status_bitmap(old_slot, false);
+                }
+            }
+        }
+    }
+}
+
+uint8_t rrc_get_current_nc_slot(void) {
+    // Return current NC slot based on frame timing
+    // Simplified: return our assigned slot
+    return rrc_get_my_nc_slot();
+}
+
+// ============================================================================
 // FSM FUNCTIONS (IPC-Modified)
 // ============================================================================
 
