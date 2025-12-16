@@ -42,6 +42,7 @@
 // RRC Configuration
 #define RRC_MESSAGE_POOL_SIZE 16
 #define MAX_MONITORED_NODES 40
+#define MAX_NEIGHBORS 40  // Same as MAX_MONITORED_NODES
 #define RRC_CONNECTION_POOL_SIZE 8
 #define RRC_INACTIVITY_TIMEOUT_SEC 30
 #define RRC_SETUP_TIMEOUT_SEC 10
@@ -79,7 +80,7 @@ static uint8_t rrc_node_id = 1;
 
 // Message queue configuration
 #define MQ_MAX_MESSAGES 10
-#define MQ_MESSAGE_SIZE 4096
+#define MQ_MESSAGE_SIZE 8192  // Must be >= sizeof(IPC_Message), using 8192 for safety
 #define APP_RRC_QUEUE_SIZE 20
 
 // ============================================================================
@@ -852,7 +853,7 @@ typedef struct {
     uint8_t priority;
 } SlotStatusInfo;
 
-void rrc_generate_slot_status(SlotStatusInfo slot_status[10]);
+// Removed duplicate declaration - defined below
 void rrc_update_nc_schedule(void);
 uint8_t rrc_get_current_nc_slot(void);
 
@@ -1090,38 +1091,59 @@ int rrc_ipc_init(void) {
     
     printf("RRC: Initializing IPC...\n");
     
-    // Open message queues (unidirectional)
-    mq_olsr_to_rrc = mq_open(MQ_OLSR_TO_RRC, O_CREAT | O_RDONLY, 0644, &attr);
+    // Unlink any existing queues and shared memory to start fresh
+    printf("RRC: Cleaning up any existing IPC resources...\n");
+    mq_unlink(MQ_OLSR_TO_RRC);
+    mq_unlink(MQ_RRC_TO_OLSR);
+    mq_unlink(MQ_TDMA_TO_RRC);
+    mq_unlink(MQ_RRC_TO_TDMA);
+    mq_unlink(MQ_PHY_TO_RRC);
+    mq_unlink(MQ_RRC_TO_PHY);
+    shm_unlink(SHM_RRC_QUEUES);
+    shm_unlink(SHM_APP_RRC);
+    printf("RRC: Cleanup complete. Creating fresh IPC resources with mq_msgsize=%d\n", MQ_MESSAGE_SIZE);
+    
+    // Verify sizeof(IPC_Message) fits in MQ_MESSAGE_SIZE
+    if (sizeof(IPC_Message) > MQ_MESSAGE_SIZE) {
+        fprintf(stderr, "ERROR: sizeof(IPC_Message)=%lu > MQ_MESSAGE_SIZE=%d\n", 
+                sizeof(IPC_Message), MQ_MESSAGE_SIZE);
+        return -1;
+    }
+    printf("RRC: sizeof(IPC_Message)=%lu, MQ_MESSAGE_SIZE=%d (OK)\n", 
+           sizeof(IPC_Message), MQ_MESSAGE_SIZE);
+    
+    // Open message queues (unidirectional) with O_EXCL to ensure fresh creation
+    mq_olsr_to_rrc = mq_open(MQ_OLSR_TO_RRC, O_CREAT | O_EXCL | O_RDONLY, 0644, &attr);
     if (mq_olsr_to_rrc == -1) {
         perror("mq_open(MQ_OLSR_TO_RRC)");
         goto cleanup;
     }
     
-    mq_rrc_to_olsr = mq_open(MQ_RRC_TO_OLSR, O_CREAT | O_WRONLY, 0644, &attr);
+    mq_rrc_to_olsr = mq_open(MQ_RRC_TO_OLSR, O_CREAT | O_EXCL | O_WRONLY, 0644, &attr);
     if (mq_rrc_to_olsr == -1) {
         perror("mq_open(MQ_RRC_TO_OLSR)");
         goto cleanup;
     }
     
-    mq_tdma_to_rrc = mq_open(MQ_TDMA_TO_RRC, O_CREAT | O_RDONLY, 0644, &attr);
+    mq_tdma_to_rrc = mq_open(MQ_TDMA_TO_RRC, O_CREAT | O_EXCL | O_RDONLY, 0644, &attr);
     if (mq_tdma_to_rrc == -1) {
         perror("mq_open(MQ_TDMA_TO_RRC)");
         goto cleanup;
     }
     
-    mq_rrc_to_tdma = mq_open(MQ_RRC_TO_TDMA, O_CREAT | O_WRONLY, 0644, &attr);
+    mq_rrc_to_tdma = mq_open(MQ_RRC_TO_TDMA, O_CREAT | O_EXCL | O_WRONLY, 0644, &attr);
     if (mq_rrc_to_tdma == -1) {
         perror("mq_open(MQ_RRC_TO_TDMA)");
         goto cleanup;
     }
     
-    mq_phy_to_rrc = mq_open(MQ_PHY_TO_RRC, O_CREAT | O_RDONLY, 0644, &attr);
+    mq_phy_to_rrc = mq_open(MQ_PHY_TO_RRC, O_CREAT | O_EXCL | O_RDONLY, 0644, &attr);
     if (mq_phy_to_rrc == -1) {
         perror("mq_open(MQ_PHY_TO_RRC)");
         goto cleanup;
     }
     
-    mq_rrc_to_phy = mq_open(MQ_RRC_TO_PHY, O_CREAT | O_WRONLY, 0644, &attr);
+    mq_rrc_to_phy = mq_open(MQ_RRC_TO_PHY, O_CREAT | O_EXCL | O_WRONLY, 0644, &attr);
     if (mq_rrc_to_phy == -1) {
         perror("mq_open(MQ_RRC_TO_PHY)");
         goto cleanup;
@@ -1301,9 +1323,13 @@ int rrc_receive_from_olsr(IPC_Message *msg, bool blocking) {
     }
     
     if (blocking) {
-        ssize_t received = mq_receive(mq_olsr_to_rrc, (char *)msg, sizeof(IPC_Message), NULL);
+        ssize_t received = mq_receive(mq_olsr_to_rrc, (char *)msg, MQ_MESSAGE_SIZE, NULL);
         if (received == -1) {
-            perror("mq_receive(olsr_to_rrc)");
+            if (errno == EMSGSIZE) {
+                // Discard oversized message
+                char discard[MQ_MESSAGE_SIZE];
+                mq_receive(mq_olsr_to_rrc, discard, MQ_MESSAGE_SIZE, NULL);
+            }
             return -1;
         }
         return (int)received;
@@ -1317,10 +1343,12 @@ int rrc_receive_from_olsr(IPC_Message *msg, bool blocking) {
         }
         
         ssize_t received = mq_timedreceive(mq_olsr_to_rrc, (char *)msg, 
-                                          sizeof(IPC_Message), NULL, &timeout);
+                                          MQ_MESSAGE_SIZE, NULL, &timeout);
         if (received == -1) {
-            if (errno != ETIMEDOUT) {
-                perror("mq_timedreceive(olsr_to_rrc)");
+            if (errno == EMSGSIZE) {
+                // Discard oversized message
+                char discard[MQ_MESSAGE_SIZE];
+                mq_timedreceive(mq_olsr_to_rrc, discard, MQ_MESSAGE_SIZE, NULL, &timeout);
             }
             return -1;
         }
@@ -1347,9 +1375,12 @@ int rrc_receive_from_tdma(IPC_Message *msg, bool blocking) {
     }
     
     if (blocking) {
-        ssize_t received = mq_receive(mq_tdma_to_rrc, (char *)msg, sizeof(IPC_Message), NULL);
+        ssize_t received = mq_receive(mq_tdma_to_rrc, (char *)msg, MQ_MESSAGE_SIZE, NULL);
         if (received == -1) {
-            perror("mq_receive(tdma_to_rrc)");
+            if (errno == EMSGSIZE) {
+                char discard[MQ_MESSAGE_SIZE];
+                mq_receive(mq_tdma_to_rrc, discard, MQ_MESSAGE_SIZE, NULL);
+            }
             return -1;
         }
         return (int)received;
@@ -1363,10 +1394,11 @@ int rrc_receive_from_tdma(IPC_Message *msg, bool blocking) {
         }
         
         ssize_t received = mq_timedreceive(mq_tdma_to_rrc, (char *)msg,
-                                          sizeof(IPC_Message), NULL, &timeout);
+                                          MQ_MESSAGE_SIZE, NULL, &timeout);
         if (received == -1) {
-            if (errno != ETIMEDOUT) {
-                perror("mq_timedreceive(tdma_to_rrc)");
+            if (errno == EMSGSIZE) {
+                char discard[MQ_MESSAGE_SIZE];
+                mq_timedreceive(mq_tdma_to_rrc, discard, MQ_MESSAGE_SIZE, NULL, &timeout);
             }
             return -1;
         }
@@ -1393,9 +1425,12 @@ int rrc_receive_from_phy(IPC_Message *msg, bool blocking) {
     }
     
     if (blocking) {
-        ssize_t received = mq_receive(mq_phy_to_rrc, (char *)msg, sizeof(IPC_Message), NULL);
+        ssize_t received = mq_receive(mq_phy_to_rrc, (char *)msg, MQ_MESSAGE_SIZE, NULL);
         if (received == -1) {
-            perror("mq_receive(phy_to_rrc)");
+            if (errno == EMSGSIZE) {
+                char discard[MQ_MESSAGE_SIZE];
+                mq_receive(mq_phy_to_rrc, discard, MQ_MESSAGE_SIZE, NULL);
+            }
             return -1;
         }
         return (int)received;
@@ -1409,10 +1444,11 @@ int rrc_receive_from_phy(IPC_Message *msg, bool blocking) {
         }
         
         ssize_t received = mq_timedreceive(mq_phy_to_rrc, (char *)msg,
-                                          sizeof(IPC_Message), NULL, &timeout);
+                                          MQ_MESSAGE_SIZE, NULL, &timeout);
         if (received == -1) {
-            if (errno != ETIMEDOUT) {
-                perror("mq_timedreceive(phy_to_rrc)");
+            if (errno == EMSGSIZE) {
+                char discard[MQ_MESSAGE_SIZE];
+                mq_timedreceive(mq_phy_to_rrc, discard, MQ_MESSAGE_SIZE, NULL, &timeout);
             }
             return -1;
         }
@@ -1600,30 +1636,8 @@ void release_app_packet(CustomApplicationPacket *packet) {
     }
 }
 
-ApplicationMessage *get_free_message(void) {
-    if (!pool_initialized) init_message_pool();
-    
-    for (int i = 0; i < RRC_MESSAGE_POOL_SIZE; i++) {
-        if (!message_pool[i].in_use) {
-            message_pool[i].in_use = true;
-            memset(message_pool[i].data, 0, PAYLOAD_SIZE_BYTES);
-            message_pool[i].data_size = 0;
-            return &message_pool[i];
-        }
-    }
-    printf("RRC: ERROR - Message pool exhausted\n");
-    rrc_stats.messages_discarded_no_slots++;
-    return NULL;
-}
-
-void release_message(ApplicationMessage *msg) {
-    if (!msg) return;
-    
-    if (msg >= message_pool && msg < (message_pool + RRC_MESSAGE_POOL_SIZE)) {
-        msg->in_use = false;
-        msg->data_size = 0;
-    }
-}
+// Duplicate function implementations removed (already defined above)
+// get_free_message() and release_message() are defined once at lines 1054-1077
 
 // ============================================================================
 // RRC NODE CONFIGURATION
@@ -3153,3 +3167,5 @@ int main(int argc, char *argv[]) {
     printf("RRC: Shutdown complete\n");
     printf("========================================\n\n");
     
+    return 0;
+}
