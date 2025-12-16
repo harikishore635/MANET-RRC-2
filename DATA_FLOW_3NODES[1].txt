@@ -1,0 +1,245 @@
+═══════════════════════════════════════════════════════════════════════════════
+           RRC POSIX INTEGRATION - 3-NODE DATA FLOW EXPLANATION
+═══════════════════════════════════════════════════════════════════════════════
+
+NETWORK TOPOLOGY:  [Node 1] ◄──radio──► [Node 2] ◄──radio──► [Node 3]
+
+SCENARIO: Node 1 Application sends "Hello Node 3" to Node 3 Application
+          Path: Node 1 → Node 2 (relay) → Node 3
+
+═══════════════════════════════════════════════════════════════════════════════
+                    TRANSMIT PATH: APP → RRC → PHY (Node 1)
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─ STEP 1: APPLICATION SUBMITS PACKET ─────────────────────────────────────┐
+│ Location: Node 1 - Application Process                                   │
+│ Action:   Allocate space in shared memory                                │
+│ SHM:      /rrc_app_pool_shm[index=0] ← allocate entry                    │
+│ Data:     Write packet (src_id=1, dest_id=3, payload="Hello Node 3")     │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 2: APP NOTIFIES RRC ───────────────────────────────────────────────┐
+│ Location: Node 1 - Application → RRC                                     │
+│ Action:   Send notification message                                      │
+│ MQ:       /rrc_app_to_rrc_mq ← AppToRrcMsg(pool_index=0, dtype=0)       │
+│ Purpose:  Tell RRC "I have a packet ready at pool index 0"              │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 3: RRC READS PACKET ───────────────────────────────────────────────┐
+│ Location: Node 1 - RRC Process                                           │
+│ Action:   Receive notification and read packet                           │
+│ MQ:       /rrc_app_to_rrc_mq → receive message                          │
+│ SHM:      /rrc_app_pool_shm[0] → read packet                            │
+│ Parse:    Extract dest_id=3, src_id=1 from packet                       │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 4: RRC REQUESTS ROUTE FROM OLSR ───────────────────────────────────┐
+│ Location: Node 1 - RRC → OLSR                                            │
+│ Action:   Ask routing layer for path to destination                      │
+│ MQ:       /rrc_rrc_to_olsr_mq ← RrcToOlsrMsg(dest_node=3)               │
+│ Question: "How do I reach Node 3?"                                       │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 5: OLSR LOOKS UP ROUTE ────────────────────────────────────────────┐
+│ Location: Node 1 - OLSR Process                                          │
+│ Action:   Search routing table                                           │
+│ MQ:       /rrc_rrc_to_olsr_mq → receive request                         │
+│ Lookup:   Routing Table: dest=3 → next_hop=2, hop_count=2               │
+│ Result:   "To reach Node 3, send to Node 2 first"                       │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 6: OLSR RETURNS ROUTE ─────────────────────────────────────────────┐
+│ Location: Node 1 - OLSR → RRC                                            │
+│ Action:   Send route information back                                    │
+│ MQ:       /rrc_olsr_to_rrc_mq ← OlsrToRrcMsg(next_hop=2, hop_count=2)   │
+│ Answer:   "Send to Node 2, it will relay to Node 3"                     │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 7A: RRC NC SLOT ALLOCATION (ROUND-ROBIN + SEEDEX) ────────────────┐
+│ Location: Node 1 - RRC NC Slot Manager                                   │
+│ Action:   Allocate NC slot for neighbor Node 2 using hybrid algorithm    
+│ RRC API:  rrc_assign_nc_slot(nodeID=2)                                  
+│ Algo:     1. Check slot_info_table[neighbor=2]                          
+│           2. If not assigned, use Round-Robin (next available)           │
+│           3. If conflict, use Seedex hash: hash(nodeID, epoch) % 40     │
+│                                                                           
+│ Result:   NC slot 5 assigned to neighbor Node 2                         │
+│ Update:   neighbor_table[Node2].assignedNCSlot = 5                      │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 7B: RRC PROCESSES HELLO MESSAGE FOR NC BROADCAST ──────────────────┐
+│ Location: Node 1 - RRC OLSR NC Queue                                     │
+│ Action:   Check if OLSR hello message needs NC slot broadcast            │
+│ RRC API:  receive_hello_packet_and_forward_to_tdma()                    │
+│ Check:    If hello message exists, enqueue to NC queue                   │
+│ Queue:    rrc_olsr_nc_queue ← hello_frame(assigned_slot=5)              │
+│ Purpose:  Hello messages broadcast in NC slots for neighbor discovery    │
+│ Note:     RRC manages NC queue, TDMA dequeues via API calls              │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 8: RRC BUILDS FRAME WITH PIGGYBACK TLV ────────────────────────────┐
+│ Location: Node 1 - RRC Process                                           │
+│ Action:   Allocate frame buffer and build complete frame with piggyback  │
+│ SHM:      /rrc_frame_pool_shm[index=1] ← allocate entry                 │
+│ Build:    Frame(src=1, dest=3, next_hop=2, ttl=16, payload=app_data)    │
+│ RRC API:  rrc_build_piggyback_tlv(&tlv)                                 │
+│ TLV:      PiggybackTLV(myNodeID=1, myNCSlot=3, sessionID, trafficType)  │
+│ Attach:   Append piggyback TLV to frame for neighbor NC coordination    │
+│ Status:   rrc_generate_slot_status() → NC bitmap + DU/GU usage bitmap   │
+└───────────────────────────────────────────────────────────────────────────┘
+
+
+┌─ STEP 9: RRC ENQUEUES TO APPROPRIATE QUEUE ──────────────────────────────┐
+│ Location: Node 1 - RRC Process                                           │
+│ Action:   Route frame to correct queue based on data type and purpose    │
+│ RRC API:  enqueue_to_appropriate_queue(app_msg, next_hop=2)             │
+│ Logic:    If data packet → data_from_l3_queue[priority]                 │
+│           If OLSR hello → rrc_olsr_nc_queue (NC broadcast)              │
+│           If relay packet → rrc_relay_queue                              │
+│ Enqueue:  data_from_l3_queue[PRIORITY_HIGH] ← frame                     │
+│ Note:     RRC owns NC queue and relay queue for TDMA API access         │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 10: TDMA CALLS RRC APIs FOR QUEUE ACCESS ──────────────────────────┐
+│ Location: Node 1 - TDMA Process                                          │
+│ Action:   TDMA uses RRC APIs to check and dequeue frames                 │
+│ APIs:     1. rrc_has_nc_packet_for_slot(target_slot=5) → true           │
+│           2. rrc_tdma_dequeue_nc_packet(target_slot=5) → hello_frame     │
+│           3. rrc_has_relay_packets() → check relay queue                 │
+│           4. rrc_tdma_dequeue_relay_packet() → get relay frame           │
+│ Schedule: TDMA schedules frames in DU/GU slots based on priority         │
+│ Result:   Data frame scheduled in DU slot 3, Hello in NC slot 5         │
+└───────────────────────────────────────────────────────────────────────────┘
+│ Schedule: Assign to DU slot based on priority and availability           │
+│ Result:   "Frame scheduled for transmission in DU slot 3"               │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 11: PHY TRANSMITS FRAME ───────────────────────────────────────────┐
+│ Location: Node 1 - PHY Layer                                             │
+│ Action:   Read frame from shared memory and transmit via radio           │
+│ SHM:      /rrc_frame_pool_shm[1] → read frame                           │
+│ Radio:    Transmit frame in DU slot 3 to Node 2 (NC slot 5 context)     │
+│ ─────────► Frame travels through air from Node 1 to Node 2               │
+└───────────────────────────────────────────────────────────────────────────┘
+
+[NOTE: Node 2 receives, checks dest_id=3≠2, relays to Node 3]
+[RRC ROLE: NC slot allocation, piggyback TLV, hello messages, slot_info_table]
+[TDMA ROLE: Actual DU/GU slot scheduling and timing control]
+
+═══════════════════════════════════════════════════════════════════════════════
+                    RECEIVE PATH: PHY → RRC → APP (Node 3)
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─ STEP 12: PHY RECEIVES FRAME ────────────────────────────────────────────┐
+│ Location: Node 3 - PHY/MAC Layer                                         │
+│ Action:   Radio receives frame from Node 2                               │
+│ Radio:    ◄───────── Frame arrives via radio (from Node 2's relay)       │
+│ Decode:   Extract frame data, measure RSSI=-55dBm, SNR=20dB             │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 13: MAC STORES RECEIVED FRAME ─────────────────────────────────────┐
+│ Location: Node 3 - MAC Process                                           │
+│ Action:   Allocate buffer and store received frame                       │
+│ SHM:      /rrc_mac_rx_pool_shm[index=5] ← allocate entry                │
+│ Write:    Store frame (src=1, dest=3, payload="Hello Node 3")           │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 14: MAC NOTIFIES RRC ──────────────────────────────────────────────┐
+│ Location: Node 3 - MAC → RRC                                             │
+│ Action:   Send notification about received frame                         │
+│ MQ:       /rrc_mac_to_rrc_mq ← MacToRrcMsg(pool_idx=5, rssi=-55, snr=20)│
+│ Message:  "Frame received at pool index 5 with good signal quality"     │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 15: RRC READS AND FILTERS FRAME ───────────────────────────────────┐
+│ Location: Node 3 - RRC Process                                           │
+│ Action:   Receive notification and read frame                            │
+│ MQ:       /rrc_mac_to_rrc_mq → receive message                          │
+│ SHM:      /rrc_mac_rx_pool_shm[5] → read frame                          │
+│ Check:    dest_id=3 == my_node_id=3? YES → Frame is for me!             │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 16: RRC PREPARES FRAME FOR APP ────────────────────────────────────┐
+│ Location: Node 3 - RRC Process                                           │
+│ Action:   Copy frame to application delivery pool                        │
+│ SHM:      /rrc_frame_pool_shm[index=2] ← allocate entry                 │
+│ Copy:     Copy frame from MAC RX pool to delivery pool                   │
+│ Release:  /rrc_mac_rx_pool_shm[5] → release (MAC pool freed)            │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 17: RRC NOTIFIES APPLICATION ──────────────────────────────────────┐
+│ Location: Node 3 - RRC → Application                                     │
+│ Action:   Send frame delivery notification                               │
+│ MQ:       /rrc_rrc_to_app_mq ← RrcToAppMsg(pool_idx=2, is_error=0)      │
+│ Message:  "Frame ready for you at pool index 2"                         │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌─ STEP 18: APP RECEIVES AND PROCESSES ────────────────────────────────────┐
+│ Location: Node 3 - Application Process                                   │
+│ Action:   Receive notification and read frame                            │
+│ MQ:       /rrc_rrc_to_app_mq → receive message                          │
+│ SHM:      /rrc_frame_pool_shm[2] → read frame                           │
+│ Display:  "Received from Node 1: Hello Node 3" ✓                        │
+│ Cleanup:  /rrc_frame_pool_shm[2] → release (pool freed)                 │
+└───────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                              IPC RESOURCES SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+MESSAGE QUEUES (7 total):
+  /rrc_app_to_rrc_mq      APP → RRC packet submission notifications
+  /rrc_rrc_to_app_mq      RRC → APP frame delivery and error messages
+  /rrc_rrc_to_olsr_mq     RRC → OLSR route lookup requests
+  /rrc_olsr_to_rrc_mq     OLSR → RRC route lookup responses
+  /rrc_rrc_to_tdma_mq     RRC → TDMA frame ready notifications (NC slot context)
+  /rrc_tdma_to_rrc_mq     TDMA → RRC hello messages and NC slot updates
+  /rrc_mac_to_rrc_mq      MAC → RRC received frame notifications
+
+SHARED MEMORY POOLS (3 total):
+  /rrc_app_pool_shm       Application packet storage (32 × 3KB = 96KB)
+  /rrc_frame_pool_shm     RRC frame storage for TX/RX (64 × 3KB = 192KB)
+  /rrc_mac_rx_pool_shm    MAC received frame storage (64 × 3KB = 192KB)
+RRC RESPONSIBILITIES:
+  ✓ NC Slot Allocation    - Hybrid Round-Robin + Seedex hash algorithm
+                            rrc_assign_nc_slot(nodeID) → assigns 1 of 40 NC slots
+  ✓ NC Slot Algorithms    - Round-Robin: sequential assignment
+                            Seedex: hash(nodeID, epoch) % 40 for conflict resolution
+  ✓ 2-Tier Priority       - Priority score: urgent (source) > hop_count(relay) 
+                            rrc_add_nc_reservation() → priority-based allocation
+  ✓ Piggyback TLV         - rrc_build_piggyback_tlv() → attach NC slot info
+                            Contains: myNodeID, myNCSlot, sessionID, trafficType
+  ✓ Hello Messages        - receive_hello_packet_and_forward_to_tdma()
+                            Enqueue to rrc_olsr_nc_queue for NC broadcast
+  ✓ NC Queue Management   - rrc_olsr_nc_queue (owned by RRC)
+                            TDMA accesses via: rrc_tdma_dequeue_nc_packet()
+  ✓ Relay Queue           - rrc_relay_queue (owned by RRC)
+                            TDMA accesses via: rrc_tdma_dequeue_relay_packet()
+  ✓ Slot Status Table     - rrc_generate_slot_status() → NC + DU/GU bitmaps
+                            neighbor_table[].assignedNCSlot tracking
+  ✓ Neighbor State        - rrc_create_neighbor_state() → track NC assignments
+                            rrc_update_neighbor_slots() → TX/RX slot coordination
+
+RRC APIs FOR TDMA TEAM:
+  • rrc_has_nc_packet_for_slot(slot)     - Check if NC queue has packets
+  • rrc_tdma_dequeue_nc_packet(slot)     - Get NC frame for broadcast
+  • rrc_has_relay_packets()               - Check if relay queue has packets
+  • rrc_tdma_dequeue_relay_packet()      - Get relay frame for forwarding
+  • rrc_get_my_nc_slot()                 - Get this node's assigned NC slot
+  • rrc_is_neighbor_tx(nodeID, slot)     - Check if neighbor will TX in slot
+  • rrc_is_neighbor_rx(nodeID, slot)     - Check if neighbor expects RX in slot
+
+TDMA RESPONSIBILITIES:
+  ✓ DU/GU Slot Scheduling - Assign actual transmission time slots (DU=data, GU=guard)
+  ✓ Frame Timing          - Control precise transmission timing per slot
+  ✓ Slot Coordination     - Manage slot conflicts and collisions
+  ✓ MAC Scheduling        - Call RRC APIs to dequeue frames from NC/relay queues
+  ✓ NC Broadcast          - Transmit NC frames in assigned NC slots (from RRC queue)servation
+
+TDMA RESPONSIBILITIES:
+  ✓ DU/GU Slot Scheduling - Assign actual transmission time slots
+  ✓ Frame Timing          - Control precise transmission timing
+  ✓ Slot Coordination     - Manage slot conflicts and collisions
+  ✓ MAC Scheduling        - Handle MAC layer scheduling decisions
+
+═══════════════════════════════════════════════════════════════════════════════

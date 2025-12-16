@@ -1,0 +1,177 @@
+================================================================================
+RRC SLOT MANAGEMENT UPDATE - SLOTS 0-7 NOW MANAGED BY RRC
+================================================================================
+Date: December 16, 2025
+Changes Applied to: rccv2.c
+
+OVERVIEW:
+---------
+RRC now handles slot allocation for slots 0-7 (DU/GU slots) internally without 
+querying TDMA layer for availability. This change makes RRC the sole owner of 
+slot allocation decisions for these slots.
+
+KEY CHANGES:
+------------
+
+1. NEW DATA STRUCTURES
+   - Added rrc_slot_allocation[8] array to track slot allocation state
+   - Each slot tracks: allocation status, assigned node, priority, timestamps
+   - Added rrc_slot_stats structure for monitoring slot usage
+
+2. NEW FUNCTIONS ADDED
+   - init_rrc_slot_allocation()
+     * Initializes RRC's internal slot tracking for slots 0-7
+   
+   - rrc_allocate_slot_internal(next_hop_node, priority)
+     * Returns: slot_id (0-7) or -1 if no slots available
+     * First tries to reuse existing slot for same next_hop/priority
+     * Then allocates first free slot
+     * Updates allocation statistics
+   
+   - rrc_release_slot_internal(slot_id)
+     * Releases allocated slot back to free pool
+     * Updates statistics
+   
+   - rrc_cleanup_stale_slot_allocations()
+     * Periodic cleanup of slots idle for >60 seconds
+     * Called from rrc_periodic_system_management()
+
+3. MODIFIED FUNCTIONS
+   - tdma_check_slot_available(next_hop_node, priority)
+     * BEFORE: Sent message queue request to TDMA layer
+     * AFTER: Checks RRC internal slot availability
+     * No more TDMA queries for slot availability
+   
+   - init_rrc_fsm()
+     * Added call to init_rrc_slot_allocation()
+     * Prints "Now managing slots 0-7 internally"
+   
+   - rrc_periodic_system_management()
+     * Added call to rrc_cleanup_stale_slot_allocations()
+   
+   - print_rrc_stats()
+     * Added section showing RRC slot management statistics
+     * Shows current allocation status for all 8 slots
+
+SLOT ALLOCATION ALGORITHM (THREE-TIER PRIORITY):
+------------------------------------------------
+TIER 1 (Score 1000-1500): Self-generated traffic - HIGHEST PRIORITY
+TIER 2 (Score 2000-2300): Short-hop relay (1-2 hops) - MEDIUM PRIORITY
+TIER 3 (Score 2300+):      Long-hop relay (3+ hops) - LOWER PRIORITY
+
+Allocation Steps:
+1. Check if same next_hop+priority already has a slot → REUSE
+2. Find first free slot → ALLOCATE
+3. Calculate priority scores for all occupied slots
+4. If new request has significantly higher priority (500+ point difference) → PREEMPT
+5. No slots available → FAIL (return -1)
+
+Priority Score = Base Score + Priority Adjustment + Packet Bonus + Timestamp
+- Self traffic base: 1000
+- Short relay base: 2000 + (hops × 100)  
+- Long relay base: 2000 + (hops × 200)
+- Priority adjustment: (4 - priority) × 50
+- Packet bonus: -10 for 10+ packets, -5 for 5-9 packets
+
+Preemption Threshold: 500 points (prevents slot thrashing)
+Timeout: Slots unused for 60 seconds are automatically released
+
+BENEFITS:
+---------
+✓ Eliminates message queue roundtrip to TDMA for slot checks
+✓ Faster slot allocation decisions (no IPC overhead)
+✓ RRC has complete visibility of slot usage
+✓ Simplified integration - TDMA only handles MAC timing
+✓ Automatic cleanup of stale allocations
+✓ THREE-TIER PRIORITY ensures fair resource allocation:
+  - Self-traffic gets priority over relay traffic
+  - Short paths preferred over long paths  
+  - Priority-based preemption when slots are scarce
+  - 500-point threshold prevents slot thrashing
+
+RESPONSIBILITIES AFTER UPDATE:
+------------------------------
+RRC HANDLES:
+- Slot allocation/deallocation for slots 0-7
+- Slot availability checks
+- Priority-based slot assignment
+- Stale slot cleanup
+- Slot usage statistics
+
+TDMA HANDLES:
+- MAC timing and synchronization
+- Physical transmission in allocated slots
+- NC slot transmission (slots 8-9)
+- Frame timing and supercycle management
+
+STATISTICS AVAILABLE:
+---------------------
+- Slots allocated (total count)
+- Slots released (total count)
+- Allocation failures (when all slots in use)
+- Slot conflicts (future use)
+- Current allocation state (per-slot status)
+
+TESTING RECOMMENDATIONS:
+------------------------
+1. Verify slot allocation works without TDMA queries
+2. Test slot reuse for repeated transmissions to same next_hop
+3. Verify automatic cleanup after 60 seconds of inactivity
+4. Check statistics reporting in print_rrc_stats()
+5. Test behavior when all 8 slots are allocated
+
+BACKWARD COMPATIBILITY:
+-----------------------
+- Function signature tdma_check_slot_available() unchanged
+- External callers see no difference
+- Internal implementation completely replaced
+- No changes needed in calling code
+
+API SUMMARY:
+------------
+Public Functions:
+- tdma_check_slot_available(next_hop, priority) → bool
+  Returns true if RRC has slot available (or can preempt)
+
+Internal Functions:
+- init_rrc_slot_allocation() → void
+- rrc_allocate_slot_internal(next_hop, priority) → int (slot_id or -1)
+  Uses default assumptions (self-traffic, 1-hop, 1 packet)
+  
+- rrc_allocate_slot_with_priority(next_hop, priority, is_self, hop_count, packets) → int
+  Full control over priority parameters for advanced allocation
+  
+- rrc_release_slot_internal(slot_id) → void
+- rrc_cleanup_stale_slot_allocations() → void
+- print_slot_allocation_details() → void
+  Shows detailed view with priority scores and tier classification
+
+Priority Calculation:
+- calculate_slot_priority_score(request) → uint32_t
+- can_override_slot_by_priority(slot_id, new_score) → bool
+
+INTEGRATION NOTES:
+Preemption Threshold: 500 points (minimum priority difference for override)
+
+Priority Score Ranges:
+- Tier 1 (Self):        1000-1500
+- Tier 2 (Short relay): 2000-2300  
+- Tier 3 (Long relay):  2300+
+
+For detailed information on three-tier priority system, see:
+RRC_3TIER_PRIORITY_SLOTS.txt
+------------------
+- RRC initialization now includes slot allocation setup
+- Periodic management includes slot cleanup
+- Statistics printing includes slot management section
+- No TDMA message queue interaction for slots 0-7
+- TDMA still manages NC slots (8-9) via existing APIs
+
+CONFIGURATION:
+--------------
+#define RRC_DU_GU_SLOT_COUNT 8
+Timeout: 60 seconds (SLOT_TIMEOUT in rrc_cleanup_stale_slot_allocations)
+
+================================================================================
+END OF DOCUMENT
+================================================================================

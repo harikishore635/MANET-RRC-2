@@ -1,0 +1,362 @@
+================================================================================
+RRC THREE-TIER PRIORITY SLOT ALLOCATION SYSTEM (SLOTS 0-7)
+================================================================================
+Date: December 16, 2025
+File: rccv2.c
+
+OVERVIEW:
+---------
+RRC now uses a sophisticated three-tier priority algorithm for allocating 
+DU/GU slots (0-7). This system ensures:
+- Self-generated traffic gets highest priority
+- Short-hop relay traffic gets medium priority  
+- Long-hop relay traffic gets lower priority
+- Priority-based preemption when all slots are occupied
+
+================================================================================
+THREE-TIER PRIORITY SYSTEM
+================================================================================
+
+TIER 1: SELF-GENERATED TRAFFIC (HIGHEST PRIORITY)
+--------------------------------------------------
+Score Range: 1000-1500
+Description: Traffic originating from this node destined for other nodes
+Characteristics:
+  - Base score: 1000
+  - This node is the source
+  - Highest priority - will preempt lower tiers
+  - Examples: Voice call from this radio, data file from this node
+
+TIER 2: SHORT-HOP RELAY (MEDIUM PRIORITY)
+------------------------------------------
+Score Range: 2000-2300
+Description: Relay traffic with 1-2 hops to final destination
+Calculation: Base 2000 + (hop_count × 100)
+Characteristics:
+  - 1-hop relay: Score 2100
+  - 2-hop relay: Score 2200
+  - Medium priority - will preempt Tier 3
+  - Examples: Forwarding packet one hop closer to destination
+
+TIER 3: LONG-HOP RELAY (LOWER PRIORITY)
+----------------------------------------
+Score Range: 2300+
+Description: Relay traffic with 3+ hops to final destination
+Calculation: Base 2000 + (hop_count × 200)
+Characteristics:
+  - 3-hop relay: Score 2600
+  - 4-hop relay: Score 2800
+  - 5-hop relay: Score 3000
+  - Lower priority - can be preempted by Tiers 1 & 2
+  - Examples: Multi-hop relay across network
+
+================================================================================
+PRIORITY SCORE CALCULATION
+================================================================================
+
+Formula Components:
+-------------------
+1. BASE SCORE (Tier-based):
+   - Self traffic:     1000
+   - Short relay:      2000 + (hops × 100)
+   - Long relay:       2000 + (hops × 200)
+
+2. PRIORITY ADJUSTMENT (within tier):
+   Score += (4 - priority) × 50
+   - Priority 0 (highest): +200
+   - Priority 1:           +150
+   - Priority 2:           +100
+   - Priority 3 (lowest):  +50
+
+3. PACKET COUNT BONUS (volume consideration):
+   - 10+ packets: -10 points
+   - 5-9 packets: -5 points
+   - <5 packets:  0 points
+
+4. TIMESTAMP TIE-BREAKER:
+   Score += (timestamp % 100)
+   - Older requests get slight advantage
+
+EXAMPLE CALCULATIONS:
+---------------------
+Example 1: Self-traffic, priority 0, 15 packets
+  Base: 1000 + Priority: 200 + Volume: -10 = 1190 (TIER 1 - HIGHEST)
+
+Example 2: 1-hop relay, priority 2, 3 packets  
+  Base: 2100 + Priority: 100 + Volume: 0 = 2200 (TIER 2 - MEDIUM)
+
+Example 3: 4-hop relay, priority 3, 1 packet
+  Base: 2800 + Priority: 50 + Volume: 0 = 2850 (TIER 3 - LOWER)
+
+================================================================================
+SLOT ALLOCATION ALGORITHM
+================================================================================
+
+STEP 1: Check for Reuse
+-----------------------
+- If same next_hop + same priority already has a slot → REUSE
+- Updates last_used_time
+- No new allocation needed
+- Most efficient path
+
+STEP 2: Find Free Slot
+-----------------------
+- Scan slots 0-7 for first unallocated slot
+- Allocate immediately if found
+- Record allocation time, priority score
+- Increment allocation counter
+
+STEP 3: Priority-Based Preemption
+----------------------------------
+Conditions for preemption:
+  a) All slots must be occupied
+  b) New request must have significantly higher priority
+  c) Score difference must exceed 500 points (preemption threshold)
+  
+Process:
+  1. Calculate new request's priority score
+  2. Scan all allocated slots
+  3. Calculate each slot holder's priority score
+  4. Find slot with lowest priority (highest score)
+  5. If (current_score > new_score + 500) → OVERRIDE
+  6. Reassign slot to new request
+  7. Log preemption event
+
+STEP 4: Allocation Failure
+---------------------------
+- All slots occupied by equal/higher priority traffic
+- No slot can be preempted within 500-point threshold
+- Return -1 (allocation failed)
+- Increment failure counter
+- Caller must handle failure (queue, delay, drop)
+
+================================================================================
+PREEMPTION THRESHOLD
+================================================================================
+
+Value: 500 points
+Rationale: Prevents slot thrashing while allowing priority enforcement
+
+Examples of Valid Preemption:
+------------------------------
+✓ Self-traffic (1200) can preempt 2-hop relay (2200)
+  Difference: 1000 points > 500 threshold
+
+✓ Self-traffic (1300) can preempt 3-hop relay (2600)
+  Difference: 1300 points > 500 threshold
+
+✓ 1-hop relay (2100) can preempt 4-hop relay (2800)
+  Difference: 700 points > 500 threshold
+
+Examples of Blocked Preemption:
+--------------------------------
+✗ Self-traffic priority-2 (1100) vs self-traffic priority-3 (1050)
+  Difference: 50 points < 500 threshold
+
+✗ 1-hop relay (2100) vs 2-hop relay (2200)
+  Difference: 100 points < 500 threshold
+
+✗ 3-hop relay (2600) vs 4-hop relay (2800)
+  Difference: 200 points < 500 threshold
+
+================================================================================
+API FUNCTIONS
+================================================================================
+
+1. rrc_allocate_slot_internal(next_hop_node, priority)
+   Returns: slot_id (0-7) or -1 on failure
+   Uses default assumptions (self-traffic, 1-hop, 1 packet)
+   
+2. rrc_allocate_slot_with_priority(next_hop, priority, is_self, hop_count, packet_count)
+   Returns: slot_id (0-7) or -1 on failure
+   Full control over all priority parameters
+   
+3. rrc_release_slot_internal(slot_id)
+   Releases allocated slot back to free pool
+   
+4. rrc_cleanup_stale_slot_allocations()
+   Auto-releases slots idle for >60 seconds
+   Called periodically
+   
+5. print_slot_allocation_details()
+   Shows detailed view of all 8 slots with priority scores
+
+================================================================================
+DATA STRUCTURES
+================================================================================
+
+DU_GU_SlotRequest:
+------------------
+struct {
+    uint8_t next_hop_node;     // Destination node
+    uint8_t priority;          // Priority level 0-3
+    uint8_t hop_count;         // Hops to final destination
+    bool is_self_traffic;      // True if originated here
+    uint32_t packet_count;     // Number of packets
+    uint32_t timestamp;        // Request time
+}
+
+rrc_slot_allocation[8]:
+-----------------------
+struct {
+    uint8_t slot_id;           // 0-7
+    bool is_allocated;         // Allocation status
+    uint8_t assigned_node;     // Current holder
+    uint8_t priority;          // Priority level
+    uint32_t allocation_time;  // When allocated
+    uint32_t last_used_time;   // Last activity
+}
+
+================================================================================
+STATISTICS & MONITORING
+================================================================================
+
+Counters:
+---------
+- slots_allocated:       Total allocations
+- slots_released:        Total releases
+- allocation_failures:   Failed allocations (all busy)
+- slot_conflicts:        Preemption events
+
+Detailed View (print_slot_allocation_details):
+-----------------------------------------------
+Per-slot information:
+  - Allocation status (FREE/ALLOCATED)
+  - Assigned node ID
+  - Priority level
+  - Calculated priority score
+  - Idle time (seconds since last use)
+  - Allocation type (SELF/SHORT-RELAY/LONG-RELAY)
+
+================================================================================
+USAGE EXAMPLES
+================================================================================
+
+Example 1: Voice Call Originating from This Node
+-------------------------------------------------
+Call: rrc_allocate_slot_with_priority(dest_node=5, priority=0, 
+                                      is_self=true, hop_count=1, packet_count=20)
+Priority Score: 1000 + 200 - 10 = 1190 (TIER 1)
+Result: Gets highest priority, will preempt any relay traffic
+
+Example 2: Short Relay (1 hop)
+-------------------------------
+Call: rrc_allocate_slot_with_priority(dest_node=8, priority=2,
+                                      is_self=false, hop_count=1, packet_count=5)
+Priority Score: 2100 + 100 - 5 = 2195 (TIER 2)
+Result: Medium priority, will preempt long relay traffic
+
+Example 3: Long Relay (4 hops)
+-------------------------------
+Call: rrc_allocate_slot_with_priority(dest_node=12, priority=3,
+                                      is_self=false, hop_count=4, packet_count=2)
+Priority Score: 2800 + 50 = 2850 (TIER 3)
+Result: Lower priority, can be preempted by self or short relay
+
+Example 4: All Slots Busy - Preemption Occurs
+----------------------------------------------
+Current State: All 8 slots occupied by 3-hop relay traffic (score ~2600)
+New Request: Self-traffic with score 1200
+Action: Lowest priority slot (highest score) is preempted
+Result: Self-traffic gets slot, relay packet must re-queue
+
+Example 5: All Slots Busy - No Preemption
+------------------------------------------
+Current State: All 8 slots occupied by self-traffic (score ~1200)
+New Request: Self-traffic with score 1250
+Action: Score difference only 50 points (< 500 threshold)
+Result: Allocation FAILS, packet must queue or retry
+
+================================================================================
+INTEGRATION POINTS
+================================================================================
+
+Initialization:
+--------------
+- Called from init_rrc_fsm()
+- Sets up slot allocation table
+- Initializes statistics counters
+
+Periodic Management:
+-------------------
+- rrc_periodic_system_management() calls rrc_cleanup_stale_slot_allocations()
+- Runs every cycle
+- Removes stale allocations (>60 sec idle)
+
+Statistics Reporting:
+---------------------
+- print_rrc_stats() includes slot management section
+- Calls print_slot_allocation_details() for detailed view
+- Shows tier classification for each allocated slot
+
+Slot Availability Check:
+------------------------
+- tdma_check_slot_available() uses RRC internal allocation
+- No TDMA message queue interaction for slots 0-7
+- Returns true if slot available OR can be preempted
+
+================================================================================
+BENEFITS OF THREE-TIER SYSTEM
+================================================================================
+
+1. FAIRNESS
+   - Local traffic doesn't starve relay traffic
+   - But gets priority when needed
+
+2. EFFICIENCY  
+   - Short paths favored over long paths
+   - Reduces overall network latency
+
+3. ADAPTABILITY
+   - System adjusts to traffic mix
+   - Preemption allows dynamic reallocation
+
+4. STABILITY
+   - 500-point threshold prevents thrashing
+   - Slot reuse minimizes reassignments
+
+5. VISIBILITY
+   - Detailed logging of preemption events
+   - Statistics show allocation patterns
+   - Easy to tune thresholds
+
+================================================================================
+TUNING PARAMETERS
+================================================================================
+
+Preemption Threshold: 500 points
+- Increase to reduce preemption frequency (more stable)
+- Decrease to allow more aggressive priority enforcement (more fair)
+
+Stale Timeout: 60 seconds
+- Increase to keep allocations longer (better for bursty traffic)
+- Decrease to reclaim slots faster (better for dynamic traffic)
+
+Tier Score Ranges:
+- Tier 1 base: 1000 (keep lowest)
+- Tier 2 base: 2000 (medium)
+- Tier 3 base: 2000 with hop multiplier (highest)
+
+Hop Count Multipliers:
+- Short relay: 100 per hop
+- Long relay: 200 per hop
+- Adjust to change tier boundaries
+
+================================================================================
+FUTURE ENHANCEMENTS
+================================================================================
+
+Potential Improvements:
+-----------------------
+1. Machine learning to predict optimal thresholds
+2. Dynamic threshold adjustment based on congestion
+3. QoS class integration (voice/video/data)
+4. Traffic pattern analysis and slot reservation
+5. Multi-radio coordination for higher capacity
+6. Fairness metrics and enforcement
+7. Slot fragmentation prevention
+8. Load balancing across slots
+
+================================================================================
+END OF DOCUMENT
+================================================================================

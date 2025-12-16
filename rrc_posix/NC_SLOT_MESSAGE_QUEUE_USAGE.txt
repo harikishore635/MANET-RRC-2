@@ -1,0 +1,510 @@
+================================================================================
+        NC SLOT MESSAGE QUEUE - USAGE EXAMPLES AND DOCUMENTATION
+================================================================================
+
+This document provides usage examples for the NC Slot Message Queue implemented
+in rccv3.c. The queue uses POSIX shared memory for inter-process communication
+between RRC and TDMA layers.
+
+================================================================================
+1. STRUCTURE OVERVIEW
+================================================================================
+
+NCSlotMessage Structure:
+------------------------
+typedef struct {
+    uint8_t myAssignedNCSlot;        // NC slot 1-40
+    uint32_t timestamp;              // Message creation time
+    uint16_t sourceNodeID;           // Originating node ID
+    OLSRMessage olsr_message;        // OLSR HELLO/TC message
+    bool has_olsr_message;           // Flag: OLSR message included
+    PiggybackTLV piggyback_tlv;      // Piggyback relay information
+    bool has_piggyback;              // Flag: Piggyback info included
+    NeighborState my_neighbor_info;  // Neighbor state information
+    bool has_neighbor_info;          // Flag: Neighbor info included
+    uint32_t sequence_number;        // Message sequence number
+    bool is_valid;                   // Message validity flag
+} NCSlotMessage;
+
+Queue Configuration:
+-------------------
+- Queue Size: 10 messages (NC_SLOT_QUEUE_SIZE)
+- Shared Memory: /rrc_nc_slot_queue_shm
+- Synchronization: POSIX semaphore (inter-process mutex)
+- Circular Buffer: Front/back pointers with count tracking
+
+================================================================================
+2. BASIC USAGE EXAMPLES
+================================================================================
+
+Example 1: Build and Send Simple NC Slot Message
+-------------------------------------------------
+
+void send_basic_nc_slot_message(uint8_t nc_slot)
+{
+    NCSlotMessage msg;
+    
+    // Build base message with NC slot assignment
+    build_nc_slot_message(&msg, nc_slot);
+    
+    // Enqueue the message
+    if (nc_slot_queue_enqueue(&msg))
+    {
+        printf("Successfully sent NC slot %u message\n", nc_slot);
+    }
+    else
+    {
+        printf("Failed to send NC slot message - queue full\n");
+    }
+}
+
+Example 2: Build Message with OLSR HELLO
+-----------------------------------------
+
+void send_nc_slot_with_hello(uint8_t nc_slot, uint16_t my_node_id)
+{
+    NCSlotMessage msg;
+    OLSRMessage olsr_msg;
+    
+    // Build base NC slot message
+    build_nc_slot_message(&msg, nc_slot);
+    
+    // Create OLSR HELLO message
+    olsr_msg.msg_type = 1; // HELLO
+    olsr_msg.vtime = 6;    // Validity time
+    olsr_msg.msg_size = 64;
+    olsr_msg.originator_addr = my_node_id;
+    olsr_msg.ttl = 1;
+    olsr_msg.hop_count = 0;
+    olsr_msg.msg_seq_num = get_next_sequence_number();
+    
+    // Add HELLO payload
+    strcpy((char*)olsr_msg.payload, "HELLO from RRC");
+    olsr_msg.payload_len = strlen((char*)olsr_msg.payload);
+    
+    // Add OLSR message to NC slot message
+    add_olsr_to_nc_message(&msg, &olsr_msg);
+    
+    // Enqueue
+    nc_slot_queue_enqueue(&msg);
+}
+
+Example 3: Build Complete Message (NC + OLSR + Piggyback + Neighbor)
+---------------------------------------------------------------------
+
+void send_complete_nc_slot_message(uint8_t nc_slot)
+{
+    NCSlotMessage msg;
+    OLSRMessage olsr_msg;
+    PiggybackTLV piggyback;
+    NeighborState neighbor;
+    
+    // 1. Build base message
+    build_nc_slot_message(&msg, nc_slot);
+    
+    // 2. Add OLSR TC message
+    olsr_msg.msg_type = 2; // TC
+    olsr_msg.vtime = 15;
+    olsr_msg.msg_size = 128;
+    olsr_msg.originator_addr = rrc_node_id;
+    olsr_msg.ttl = 255;
+    olsr_msg.hop_count = 0;
+    olsr_msg.msg_seq_num = get_next_sequence_number();
+    strcpy((char*)olsr_msg.payload, "TC topology message");
+    olsr_msg.payload_len = strlen((char*)olsr_msg.payload);
+    add_olsr_to_nc_message(&msg, &olsr_msg);
+    
+    // 3. Add piggyback information
+    piggyback.myNCSlot = nc_slot;
+    piggyback.relayedFromSlot = 15;  // Relayed from slot 15
+    piggyback.finalDestSlot = 30;    // Final destination slot 30
+    piggyback.nextHopSlot = 22;      // Next hop slot 22
+    piggyback.hopCount = 2;
+    piggyback.ttl = 5;
+    add_piggyback_to_nc_message(&msg, &piggyback);
+    
+    // 4. Add neighbor state information
+    neighbor.nodeID = 42;
+    neighbor.assignedNCSlot = 18;
+    neighbor.lastSeenTime = time(NULL);
+    neighbor.linkQuality = 85;  // 85% link quality
+    neighbor.isActive = true;
+    add_neighbor_to_nc_message(&msg, &neighbor);
+    
+    // 5. Enqueue complete message
+    if (nc_slot_queue_enqueue(&msg))
+    {
+        printf("Sent complete NC slot message:\n");
+        printf("  - NC Slot: %u\n", nc_slot);
+        printf("  - OLSR: TC message\n");
+        printf("  - Piggyback: Relay info included\n");
+        printf("  - Neighbor: Node %u info included\n", neighbor.nodeID);
+    }
+}
+
+================================================================================
+3. RECEIVING MESSAGES (TDMA LAYER)
+================================================================================
+
+Example 4: Receive and Process NC Slot Messages
+------------------------------------------------
+
+void tdma_process_nc_slot_messages(void)
+{
+    NCSlotMessage msg;
+    
+    // Check if messages are available
+    while (!nc_slot_queue_is_empty())
+    {
+        // Dequeue message
+        if (nc_slot_queue_dequeue(&msg))
+        {
+            printf("\n=== Received NC Slot Message ===\n");
+            printf("NC Slot: %u\n", msg.myAssignedNCSlot);
+            printf("Source Node: %u\n", msg.sourceNodeID);
+            printf("Timestamp: %u\n", msg.timestamp);
+            
+            // Process OLSR message if present
+            if (msg.has_olsr_message)
+            {
+                printf("OLSR Message Type: %u\n", msg.olsr_message.msg_type);
+                printf("OLSR Payload: %s\n", (char*)msg.olsr_message.payload);
+                
+                // Forward to OLSR daemon or process locally
+                process_olsr_message(&msg.olsr_message);
+            }
+            
+            // Process piggyback information if present
+            if (msg.has_piggyback)
+            {
+                printf("Piggyback Info:\n");
+                printf("  Relayed from slot: %u\n", msg.piggyback_tlv.relayedFromSlot);
+                printf("  Final destination: %u\n", msg.piggyback_tlv.finalDestSlot);
+                printf("  Next hop: %u\n", msg.piggyback_tlv.nextHopSlot);
+                printf("  Hop count: %u\n", msg.piggyback_tlv.hopCount);
+                
+                // Forward packet if needed
+                if (msg.piggyback_tlv.nextHopSlot != msg.myAssignedNCSlot)
+                {
+                    relay_to_next_hop(&msg);
+                }
+            }
+            
+            // Process neighbor information if present
+            if (msg.has_neighbor_info)
+            {
+                printf("Neighbor Info:\n");
+                printf("  Neighbor Node: %u\n", msg.my_neighbor_info.nodeID);
+                printf("  Neighbor NC Slot: %u\n", msg.my_neighbor_info.assignedNCSlot);
+                printf("  Link Quality: %u%%\n", msg.my_neighbor_info.linkQuality);
+                
+                // Update neighbor table
+                update_neighbor_table(&msg.my_neighbor_info);
+            }
+            
+            printf("================================\n\n");
+        }
+    }
+}
+
+Example 5: Non-Blocking Check for Messages
+-------------------------------------------
+
+void tdma_check_nc_messages(void)
+{
+    // Quick check without blocking
+    int count = nc_slot_queue_count();
+    
+    if (count > 0)
+    {
+        printf("TDMA: %d NC slot messages waiting\n", count);
+        tdma_process_nc_slot_messages();
+    }
+    
+    // Check if queue is getting full
+    if (nc_slot_queue_count() > 8)
+    {
+        printf("WARNING: NC slot queue nearly full (%d/10)\n", count);
+    }
+}
+
+================================================================================
+4. QUEUE MANAGEMENT
+================================================================================
+
+Example 6: Monitor Queue Status
+--------------------------------
+
+void monitor_nc_slot_queue(void)
+{
+    // Print detailed queue statistics
+    print_nc_slot_queue_stats();
+    
+    // Get individual status
+    printf("Queue Status:\n");
+    printf("  Messages: %d/%d\n", nc_slot_queue_count(), NC_SLOT_QUEUE_SIZE);
+    printf("  Empty: %s\n", nc_slot_queue_is_empty() ? "YES" : "NO");
+    printf("  Full: %s\n", nc_slot_queue_is_full() ? "YES" : "NO");
+}
+
+Example 7: Handle Queue Full Condition
+---------------------------------------
+
+bool send_with_retry(const NCSlotMessage *msg, int max_retries)
+{
+    int retries = 0;
+    
+    while (retries < max_retries)
+    {
+        if (nc_slot_queue_enqueue(msg))
+        {
+            return true; // Success
+        }
+        
+        // Queue full - wait and retry
+        printf("Queue full, retry %d/%d\n", retries+1, max_retries);
+        usleep(10000); // Wait 10ms
+        retries++;
+    }
+    
+    printf("Failed to enqueue after %d retries\n", max_retries);
+    return false;
+}
+
+================================================================================
+5. INTEGRATION PATTERNS
+================================================================================
+
+Example 8: Periodic NC Slot Broadcast
+--------------------------------------
+
+void rrc_periodic_nc_broadcast(void)
+{
+    static uint32_t last_broadcast = 0;
+    uint32_t current_time = time(NULL);
+    
+    // Broadcast every 5 seconds
+    if (current_time - last_broadcast >= 5)
+    {
+        uint8_t my_nc_slot = get_my_assigned_nc_slot();
+        
+        if (my_nc_slot != 0)
+        {
+            send_complete_nc_slot_message(my_nc_slot);
+            last_broadcast = current_time;
+        }
+    }
+}
+
+Example 9: Event-Driven NC Slot Update
+---------------------------------------
+
+void rrc_on_nc_slot_assigned(uint8_t new_nc_slot)
+{
+    printf("RRC: Assigned new NC slot %u\n", new_nc_slot);
+    
+    // Immediately notify TDMA layer
+    NCSlotMessage msg;
+    build_nc_slot_message(&msg, new_nc_slot);
+    
+    // Add current neighbor information
+    NeighborState *neighbors = get_active_neighbors();
+    int neighbor_count = get_neighbor_count();
+    
+    if (neighbor_count > 0)
+    {
+        // Add first neighbor as example
+        add_neighbor_to_nc_message(&msg, &neighbors[0]);
+    }
+    
+    // Send to TDMA
+    nc_slot_queue_enqueue(&msg);
+}
+
+Example 10: Multi-Process Communication
+----------------------------------------
+
+// In RRC Process:
+void rrc_main_loop(void)
+{
+    while (running)
+    {
+        // Generate NC slot message
+        if (should_send_nc_update())
+        {
+            send_complete_nc_slot_message(my_nc_slot);
+        }
+        
+        // Other RRC tasks...
+        usleep(100000); // 100ms cycle
+    }
+}
+
+// In TDMA Process:
+void tdma_main_loop(void)
+{
+    while (running)
+    {
+        // Process incoming NC slot messages
+        tdma_check_nc_messages();
+        
+        // Perform TDMA scheduling
+        tdma_schedule_slots();
+        
+        usleep(10000); // 10ms cycle
+    }
+}
+
+================================================================================
+6. ERROR HANDLING
+================================================================================
+
+Example 11: Robust Message Handling
+------------------------------------
+
+bool safe_nc_slot_queue_operation(const NCSlotMessage *msg)
+{
+    // Validate queue initialization
+    if (nc_slot_queue_shm == NULL)
+    {
+        printf("ERROR: NC slot queue not initialized\n");
+        
+        // Attempt to initialize
+        if (init_nc_slot_queue_shm() != 0)
+        {
+            printf("ERROR: Failed to initialize queue\n");
+            return false;
+        }
+    }
+    
+    // Validate message
+    if (msg == NULL || !msg->is_valid)
+    {
+        printf("ERROR: Invalid message\n");
+        return false;
+    }
+    
+    // Validate NC slot range
+    if (msg->myAssignedNCSlot < 1 || msg->myAssignedNCSlot > 40)
+    {
+        printf("ERROR: NC slot %u out of range (1-40)\n", msg->myAssignedNCSlot);
+        return false;
+    }
+    
+    // Enqueue with error handling
+    if (!nc_slot_queue_enqueue(msg))
+    {
+        printf("ERROR: Failed to enqueue message\n");
+        
+        // Try to clear old messages if queue is full
+        if (nc_slot_queue_is_full())
+        {
+            NCSlotMessage old_msg;
+            if (nc_slot_queue_dequeue(&old_msg))
+            {
+                printf("Removed old message, retrying...\n");
+                return nc_slot_queue_enqueue(msg);
+            }
+        }
+        
+        return false;
+    }
+    
+    return true;
+}
+
+================================================================================
+7. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+1. Queue Size:
+   - Default: 10 messages
+   - Sufficient for typical NC slot updates
+   - Increase NC_SLOT_QUEUE_SIZE if messages accumulate
+
+2. Synchronization:
+   - Semaphore-based mutex for thread safety
+   - Minimal lock duration (copy only)
+   - No busy-waiting
+
+3. Memory:
+   - Shared memory segment: ~350KB (depends on NCSlotMessage size)
+   - One-time allocation, no dynamic memory
+   - Memory-mapped for fast access
+
+4. Latency:
+   - Enqueue/Dequeue: < 1μs (copy operation)
+   - Shared memory access: ~100ns
+   - No system calls during normal operation
+
+================================================================================
+8. DEBUGGING TIPS
+================================================================================
+
+1. Check queue initialization:
+   if (nc_slot_queue_shm == NULL)
+       printf("Queue not initialized!\n");
+
+2. Monitor queue depth:
+   print_nc_slot_queue_stats();
+
+3. Verify shared memory:
+   ls -la /dev/shm/rrc_nc_slot_queue_shm
+
+4. Check semaphore:
+   ls -la /dev/shm/sem.rrc_nc_slot_queue_sem
+
+5. Trace messages:
+   Enable debug prints in enqueue/dequeue functions
+
+6. Validate message contents:
+   printf("NC slot: %u, OLSR: %s, Piggyback: %s, Neighbor: %s\n",
+          msg.myAssignedNCSlot,
+          msg.has_olsr_message ? "YES" : "NO",
+          msg.has_piggyback ? "YES" : "NO",
+          msg.has_neighbor_info ? "YES" : "NO");
+
+================================================================================
+9. CONFIGURATION
+================================================================================
+
+To modify queue size, edit in rccv3.c:
+
+#define NC_SLOT_QUEUE_SIZE 10  // Change to desired size
+
+To change shared memory name:
+
+#define SHM_NC_SLOT_QUEUE "/rrc_nc_slot_queue_shm"  // Change name
+
+To change semaphore name:
+
+#define SEM_NC_SLOT_QUEUE_MUTEX "/rrc_nc_slot_queue_sem"  // Change name
+
+================================================================================
+10. API REFERENCE
+================================================================================
+
+Queue Operations:
+-----------------
+int  init_nc_slot_queue_shm(void)
+void cleanup_nc_slot_queue_shm(void)
+bool nc_slot_queue_enqueue(const NCSlotMessage *msg)
+bool nc_slot_queue_dequeue(NCSlotMessage *msg)
+bool nc_slot_queue_is_empty(void)
+bool nc_slot_queue_is_full(void)
+int  nc_slot_queue_count(void)
+
+Message Builders:
+-----------------
+void build_nc_slot_message(NCSlotMessage *msg, uint8_t nc_slot)
+void add_olsr_to_nc_message(NCSlotMessage *msg, const OLSRMessage *olsr_msg)
+void add_piggyback_to_nc_message(NCSlotMessage *msg, const PiggybackTLV *piggyback)
+void add_neighbor_to_nc_message(NCSlotMessage *msg, const NeighborState *neighbor)
+
+Statistics:
+-----------
+void print_nc_slot_queue_stats(void)
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

@@ -1,0 +1,224 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    PHY METRICS ACCESS - QUICK REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+MEMORY ADDRESSES (Default Configuration)
+─────────────────────────────────────────
+Base Address:           0x40000000 (configurable)
+Total Size:             64 KB
+
+Link Metrics Region:    BASE + 0x0000  (88 bytes per neighbor, 40 neighbors)
+RF Status Region:       BASE + 0x4000  (32 bytes)
+Diagnostics Region:     BASE + 0x8000  (48 bytes)
+Config Region:          BASE + 0xC000  (16 KB reserved)
+
+LINK METRICS ADDRESS CALCULATION
+─────────────────────────────────
+For neighbor N (1-40):
+  Address = BASE + 0x0000 + ((N - 1) × 88)
+
+Example:
+  Neighbor 1:  0x40000000 + 0 = 0x40000000
+  Neighbor 2:  0x40000000 + 88 = 0x40000058
+  Neighbor 3:  0x40000000 + 176 = 0x400000B0
+
+KEY METRICS QUICK ACCESS
+─────────────────────────
+For neighbor N at address A:
+
+  RSSI (dBm):     *(int16_t*)(A + 0x04)
+  SNR (dB):       *(int16_t*)(A + 0x06)
+  PER (×10^6):    *(uint32_t*)(A + 0x10)
+  RX Throughput:  *(uint32_t*)(A + 0x18)
+  Frames RX:      *(uint32_t*)(A + 0x28)
+  Last Update:    *(uint64_t*)(A + 0x40)
+
+API USAGE PATTERNS
+──────────────────
+
+1. INITIALIZATION
+   PhyMetricsContext ctx;
+   phy_metrics_init(&ctx, 0);  // 0 = use default address
+
+2. READ LINK METRICS
+   PhyLinkMetrics metrics;
+   phy_read_link_metrics(&ctx, neighbor_id, &metrics);
+
+3. CHECK LINK QUALITY
+   bool usable = phy_is_link_usable(&metrics, -85, 12);  // -85dBm, 12dB
+
+4. CALCULATE SCORE
+   uint8_t score = phy_calculate_link_score(&metrics);  // 0-100
+
+5. CLEANUP
+   phy_metrics_cleanup(&ctx);
+
+TYPICAL RRC WORKFLOW
+────────────────────
+
+Before sending frame to neighbor:
+  1. Read PHY metrics for neighbor
+  2. Check data age (< 500ms)
+  3. Validate RSSI >= -85 dBm
+  4. Validate SNR >= 12 dB
+  5. Validate PER < 10%
+  6. If pass → send frame
+  7. If fail → request alternate route
+
+LINK QUALITY THRESHOLDS (Recommended)
+──────────────────────────────────────
+
+Excellent Link:  RSSI > -60 dBm, SNR > 25 dB, PER < 0.1%
+Good Link:       RSSI > -75 dBm, SNR > 18 dB, PER < 1%
+Usable Link:     RSSI > -85 dBm, SNR > 12 dB, PER < 5%
+Poor Link:       RSSI > -95 dBm, SNR > 8 dB,  PER < 10%
+Unusable:        RSSI < -95 dBm or SNR < 8 dB or PER > 10%
+
+MODULATION SELECTION GUIDE
+───────────────────────────
+
+64-QAM:  SNR >= 25 dB, PER < 1%    → 6 bits/symbol, highest throughput
+16-QAM:  SNR >= 18 dB, PER < 5%    → 4 bits/symbol, balanced
+QPSK:    SNR >= 12 dB, PER < 10%   → 2 bits/symbol, robust
+BPSK:    SNR >= 8 dB               → 1 bit/symbol, most robust (fallback)
+
+ERROR RATE CONVERSIONS
+──────────────────────
+
+Stored as uint32_t (scaled):
+  BER (bit_error_rate):     value × 10^-9
+    Example: 1000 → 1e-6 (0.0001%)
+  
+  PER (packet_error_rate):  value × 10^-6
+    Example: 10000 → 1% packet error rate
+  
+  FER (frame_error_rate):   value × 10^-6
+    Example: 5000 → 0.5% frame error rate
+
+To convert to percentage:
+  BER% = bit_error_rate / 1e7
+  PER% = packet_error_rate / 1e4
+  FER% = frame_error_rate / 1e4
+
+DATA FRESHNESS CHECK
+────────────────────
+
+C code:
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  uint64_t now_ns = now.tv_sec * 1000000000ULL + now.tv_nsec;
+  uint64_t age_ms = (now_ns - metrics.last_update_ns) / 1000000;
+  
+  if (age_ms > 500) {
+      // Data too old, don't trust it
+  }
+
+LINK STATE VALUES
+─────────────────
+0 = DOWN      - No connectivity
+1 = UP        - Link operational
+2 = DEGRADED  - Link up but quality poor
+3 = UNKNOWN   - State not yet determined
+
+RF STATUS FLAGS
+───────────────
+rf_power_state:        0=OFF, 1=ON, 2=STANDBY
+rf_calibration_state:  0=UNCALIBRATED, 1=CALIBRATED
+pll_lock:              0=UNLOCKED, 1=LOCKED
+synthesizer_lock:      0=UNLOCKED, 1=LOCKED
+
+PERFORMANCE NUMBERS
+───────────────────
+Single metric read:      ~1-2 μs
+All 40 neighbors:        ~50-80 μs
+With score calculation:  ~100-150 μs
+
+PHY update rate:         10-100 Hz (recommended)
+RRC read rate:           1-10 Hz (recommended)
+Stale threshold:         500 ms (default)
+
+TESTING COMMANDS
+────────────────
+
+Build everything:
+  $ make
+
+Simulate PHY writing metrics:
+  $ ./phy_metrics_simulator 3
+
+Read metrics for neighbor 2:
+  $ sudo ./phy_metrics_test 2
+
+Run integration demo:
+  $ ./rrc_phy_integration_example 1
+
+Automated demo:
+  $ ./run_phy_metrics_demo.sh
+
+COMMON CODE SNIPPETS
+────────────────────
+
+Validate before routing:
+  if (phy_read_link_metrics(&ctx, next_hop, &m) == 0 &&
+      phy_is_link_usable(&m, -85, 12)) {
+      send_frame_to_neighbor(next_hop, frame);
+  } else {
+      request_alternate_route(dest);
+  }
+
+Select best of 3 neighbors:
+  uint8_t candidates[] = {2, 3, 4};
+  uint8_t best = select_best_neighbor(candidates, 3);
+
+Monitor all neighbors every second:
+  while (running) {
+      for (int i = 0; i < num_neighbors; i++) {
+          phy_read_link_metrics(&ctx, neighbors[i], &m);
+          if (m.packet_error_rate > 100000) alert_high_per(neighbors[i]);
+      }
+      sleep(1);
+  }
+
+HARDWARE CONFIGURATION
+──────────────────────
+
+For Zynq/FPGA:
+  1. Configure PHY IP to write to AXI address 0x40000000
+  2. Enable /dev/mem in kernel (CONFIG_DEVMEM=y)
+  3. Set update rate to 10-100 Hz
+  4. Use DMA for bulk transfers if available
+
+For simulation:
+  1. Use POSIX shared memory (/dev/shm/rrc_phy_metrics_sim)
+  2. Run phy_metrics_simulator in background
+  3. Test with phy_metrics_test
+
+MEMORY BARRIERS
+───────────────
+
+PHY side (after write):
+  __sync_synchronize();        // GCC/Clang
+  asm volatile("" ::: "memory"); // Compiler barrier
+
+RRC side:
+  Already handled by volatile keyword in API
+
+DEBUGGING TIPS
+──────────────
+
+Enable debug prints:
+  phy_print_link_metrics(neighbor_id, &metrics);
+
+Check if metrics updating:
+  Read update_count field - should increment over time
+
+Verify data freshness:
+  Compare last_update_ns with current time
+
+Check RF module:
+  phy_read_rf_status() - verify PLL lock and power state
+
+Monitor error counters:
+  phy_read_diagnostics() - check CRC errors, DMA errors, etc.
+
+═══════════════════════════════════════════════════════════════════════════════

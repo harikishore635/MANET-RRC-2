@@ -1,0 +1,419 @@
+═══════════════════════════════════════════════════════════════════════════════
+                      RRC PHY METRICS INTEGRATION
+═══════════════════════════════════════════════════════════════════════════════
+
+OVERVIEW
+────────
+This module enables RRC to access PHY-layer link quality metrics directly from
+DRAM memory addresses. The PHY hardware writes real-time metrics (RSSI, SNR,
+BER, PER, etc.) to fixed memory locations, and RRC reads them for intelligent
+routing decisions.
+
+═══════════════════════════════════════════════════════════════════════════════
+                            ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+MEMORY LAYOUT:
+──────────────
+
+PHY Metrics Base Address: 0x40000000 (configurable, hardware-dependent)
+Total Size: 64 KB
+
+Offset Map:
+  0x0000 - 0x3FFF (16 KB): Link Quality Metrics (40 neighbors × 88 bytes)
+  0x4000 - 0x7FFF (16 KB): RF Status (32 bytes)
+  0x8000 - 0xBFFF (16 KB): PHY Diagnostics (48 bytes)
+  0xC000 - 0xFFFF (16 KB): PHY Configuration Registers
+
+LINK QUALITY METRICS (Per Neighbor):
+────────────────────────────────────
+Address: BASE + 0x0000 + (neighbor_id - 1) × 88 bytes
+
+Structure Layout (88 bytes):
+  +0x00: neighbor_id (uint8_t)           - Neighbor node ID (1-255)
+  +0x01: link_state (uint8_t)            - 0=DOWN, 1=UP, 2=DEGRADED, 3=UNKNOWN
+  +0x04: rssi_dbm (int16_t)              - RSSI in dBm (-120 to 0)
+  +0x06: snr_db (int16_t)                - SNR in dB (0 to 40)
+  +0x08: noise_floor_dbm (uint16_t)      - Noise floor in dBm
+  +0x0A: signal_quality (uint16_t)       - Signal quality index 0-100
+  +0x0C: bit_error_rate (uint32_t)       - BER × 10^9
+  +0x10: packet_error_rate (uint32_t)    - PER × 10^6
+  +0x14: frame_error_rate (uint32_t)     - FER × 10^6
+  +0x18: rx_throughput (uint32_t)        - RX bytes/sec
+  +0x1C: tx_throughput (uint32_t)        - TX bytes/sec
+  +0x20: time_offset_ns (uint32_t)       - Time sync offset (ns)
+  +0x24: carrier_freq_offset (uint16_t)  - CFO in Hz
+  +0x26: timing_error_samples (uint16_t) - Timing error in samples
+  +0x28: frames_received (uint32_t)      - Total frames received
+  +0x2C: frames_lost (uint32_t)          - Frames lost (seq gaps)
+  +0x30: frames_corrupted (uint32_t)     - Frames with CRC errors
+  +0x34: frames_retried (uint32_t)       - Retransmission count
+  +0x38: channel_gain_db (float)         - Channel gain in dB
+  +0x3C: modulation_scheme (uint8_t)     - 0=BPSK, 1=QPSK, 2=16QAM, 3=64QAM
+  +0x3D: coding_rate (uint8_t)           - 0=1/2, 1=2/3, 2=3/4, 3=5/6
+  +0x40: last_update_ns (uint64_t)       - Timestamp of last PHY update
+  +0x48: update_count (uint32_t)         - Number of updates from PHY
+
+RF STATUS:
+──────────
+Address: BASE + 0x4000
+
+Structure Layout (32 bytes):
+  +0x00: rf_power_state (uint8_t)        - 0=OFF, 1=ON, 2=STANDBY
+  +0x01: rf_calibration_state (uint8_t)  - 0=UNCALIBRATED, 1=CALIBRATED
+  +0x02: rf_temperature_c (uint8_t)      - Temperature in Celsius
+  +0x03: rf_alarm_flags (uint8_t)        - Bit flags for alarms
+  +0x04: carrier_freq_hz (uint32_t)      - Current carrier frequency
+  +0x08: tx_power_dbm (int16_t)          - TX power in dBm
+  +0x0A: rx_gain_db (int16_t)            - RX gain in dB
+  +0x0C: agc_gain_level (uint16_t)       - AGC gain level (0-65535)
+  +0x0E: afc_correction_hz (int16_t)     - AFC correction in Hz
+  +0x10: pll_lock (uint8_t)              - 0=UNLOCKED, 1=LOCKED
+  +0x11: synthesizer_lock (uint8_t)      - 0=UNLOCKED, 1=LOCKED
+  +0x14: uptime_ms (uint64_t)            - RF uptime in milliseconds
+  +0x1C: total_tx_frames (uint32_t)      - Total frames transmitted
+  +0x20: total_rx_frames (uint32_t)      - Total frames received
+
+PHY DIAGNOSTICS:
+────────────────
+Address: BASE + 0x8000
+
+Structure Layout (48 bytes):
+  +0x00: dma_tx_transfers (uint32_t)     - DMA TX transfer count
+  +0x04: dma_rx_transfers (uint32_t)     - DMA RX transfer count
+  +0x08: dma_errors (uint32_t)           - DMA error count
+  +0x0C: tx_buffer_usage (uint16_t)      - TX buffer usage (0-100%)
+  +0x0E: rx_buffer_usage (uint16_t)      - RX buffer usage (0-100%)
+  +0x10: buffer_overruns (uint32_t)      - Buffer overrun count
+  +0x14: buffer_underruns (uint32_t)     - Buffer underrun count
+  +0x18: interrupt_count (uint32_t)      - Total interrupts
+  +0x1C: missed_interrupts (uint32_t)    - Missed interrupt count
+  +0x20: crc_errors (uint32_t)           - Total CRC errors
+  +0x24: sync_errors (uint32_t)          - Synchronization errors
+  +0x28: timeout_errors (uint32_t)       - Timeout errors
+  +0x2C: fifo_errors (uint32_t)          - FIFO errors
+
+═══════════════════════════════════════════════════════════════════════════════
+                               API REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+INITIALIZATION:
+───────────────
+
+int phy_metrics_init(PhyMetricsContext* ctx, uint64_t base_addr)
+  Initialize PHY metrics access by mapping memory region
+  
+  Parameters:
+    ctx        - PHY metrics context structure
+    base_addr  - Physical base address (0 = use default PHY_METRICS_BASE_ADDR)
+  
+  Returns: 0 on success, -1 on error
+  
+  Note: Requires root privileges to access /dev/mem
+        Uses mmap() to map physical memory to process virtual address space
+
+void phy_metrics_cleanup(PhyMetricsContext* ctx)
+  Cleanup and unmap PHY metrics memory region
+
+READING METRICS:
+────────────────
+
+int phy_read_link_metrics(PhyMetricsContext* ctx, uint8_t neighbor_id, 
+                          PhyLinkMetrics* metrics)
+  Read link quality metrics for specific neighbor
+  
+  Parameters:
+    ctx          - PHY metrics context (initialized)
+    neighbor_id  - Neighbor node ID (1-40)
+    metrics      - Output buffer for metrics structure
+  
+  Returns: 0 on success, -1 on error
+  
+  Access: Volatile memory read ensures fresh data from PHY hardware
+  Formula: Address = BASE + 0x0000 + (neighbor_id - 1) × 88
+
+int phy_read_rf_status(PhyMetricsContext* ctx, PhyRfStatus* status)
+  Read overall RF module status
+  
+  Parameters:
+    ctx     - PHY metrics context
+    status  - Output buffer for RF status structure
+  
+  Returns: 0 on success, -1 on error
+
+int phy_read_diagnostics(PhyMetricsContext* ctx, PhyDiagnostics* diag)
+  Read PHY diagnostics and error counters
+  
+  Parameters:
+    ctx   - PHY metrics context
+    diag  - Output buffer for diagnostics structure
+  
+  Returns: 0 on success, -1 on error
+
+HELPER FUNCTIONS:
+─────────────────
+
+uint8_t phy_calculate_link_score(const PhyLinkMetrics* metrics)
+  Calculate overall link quality score (0-100) from metrics
+  
+  Formula: Score = (RSSI × 40%) + (SNR × 40%) + (PER × 20%)
+           RSSI normalized: (rssi_dbm + 120) × 100 / 120
+           SNR normalized:  snr_db × 100 / 40
+           PER normalized:  100 - (PER / 10000)
+  
+  Returns: Score 0-100 (higher is better)
+
+bool phy_is_link_usable(const PhyLinkMetrics* metrics, 
+                        int16_t min_rssi_dbm, int16_t min_snr_db)
+  Check if link meets minimum quality thresholds
+  
+  Parameters:
+    metrics      - Link metrics to evaluate
+    min_rssi_dbm - Minimum acceptable RSSI (e.g., -85 dBm)
+    min_snr_db   - Minimum acceptable SNR (e.g., 12 dB)
+  
+  Returns: true if link is usable (UP state, meets thresholds, PER < 10%)
+
+void phy_print_link_metrics(uint8_t neighbor_id, const PhyLinkMetrics* m)
+  Print formatted link metrics for debugging
+
+═══════════════════════════════════════════════════════════════════════════════
+                          RRC INTEGRATION PATTERNS
+═══════════════════════════════════════════════════════════════════════════════
+
+PATTERN 1: Link Validation Before Routing
+──────────────────────────────────────────
+
+bool validate_next_hop(uint8_t next_hop) {
+    PhyLinkMetrics metrics;
+    
+    // Read fresh metrics from DRAM
+    if (phy_read_link_metrics(&phy_ctx, next_hop, &metrics) < 0) {
+        return false;  // Cannot read metrics
+    }
+    
+    // Check data age (reject if stale)
+    uint64_t age_ms = (current_time_ns - metrics.last_update_ns) / 1000000;
+    if (age_ms > 500) {
+        return false;  // Metrics too old
+    }
+    
+    // Validate link quality
+    return phy_is_link_usable(&metrics, -85, 12);  // -85dBm, 12dB thresholds
+}
+
+PATTERN 2: Best Neighbor Selection
+───────────────────────────────────
+
+uint8_t select_best_neighbor(uint8_t* candidates, uint8_t count) {
+    uint8_t best_neighbor = 0;
+    uint8_t best_score = 0;
+    
+    for (uint8_t i = 0; i < count; i++) {
+        PhyLinkMetrics metrics;
+        
+        if (phy_read_link_metrics(&phy_ctx, candidates[i], &metrics) == 0) {
+            uint8_t score = phy_calculate_link_score(&metrics);
+            
+            if (score > best_score) {
+                best_score = score;
+                best_neighbor = candidates[i];
+            }
+        }
+    }
+    
+    return best_neighbor;
+}
+
+PATTERN 3: Periodic Link Quality Monitoring
+────────────────────────────────────────────
+
+void monitor_neighbors(void) {
+    PhyRfStatus rf_status;
+    
+    // Check RF module health
+    if (phy_read_rf_status(&phy_ctx, &rf_status) == 0) {
+        if (rf_status.rf_power_state != 1 || !rf_status.pll_lock) {
+            trigger_rf_alarm();
+        }
+    }
+    
+    // Check each neighbor
+    for (uint8_t i = 0; i < num_neighbors; i++) {
+        PhyLinkMetrics metrics;
+        
+        if (phy_read_link_metrics(&phy_ctx, neighbors[i], &metrics) == 0) {
+            // Alert on degraded links
+            if (metrics.link_state == 2) {
+                log_link_degradation(neighbors[i]);
+            }
+            
+            // Alert on high error rates
+            if (metrics.packet_error_rate > 100000) {  // > 10%
+                log_high_error_rate(neighbors[i], metrics.packet_error_rate);
+            }
+        }
+    }
+}
+
+PATTERN 4: Adaptive Modulation Based on Metrics
+────────────────────────────────────────────────
+
+uint8_t select_modulation_scheme(uint8_t neighbor) {
+    PhyLinkMetrics metrics;
+    
+    if (phy_read_link_metrics(&phy_ctx, neighbor, &metrics) < 0) {
+        return 0;  // BPSK (most robust)
+    }
+    
+    // Select based on SNR
+    if (metrics.snr_db >= 25 && metrics.packet_error_rate < 10000) {
+        return 3;  // 64QAM (highest throughput)
+    } else if (metrics.snr_db >= 18 && metrics.packet_error_rate < 50000) {
+        return 2;  // 16QAM
+    } else if (metrics.snr_db >= 12) {
+        return 1;  // QPSK
+    } else {
+        return 0;  // BPSK (fallback)
+    }
+}
+
+═══════════════════════════════════════════════════════════════════════════════
+                         HARDWARE INTEGRATION
+═══════════════════════════════════════════════════════════════════════════════
+
+FOR ZYNQ/FPGA PLATFORMS:
+────────────────────────
+
+1. PHY writes metrics to AXI address space (e.g., 0x40000000)
+2. CPU accesses via /dev/mem with physical address mapping
+3. DMA controller can transfer metrics from PHY FIFO to DRAM
+4. Update rate: 10-100 Hz (configurable based on PHY implementation)
+
+EXAMPLE DEVICE TREE CONFIGURATION:
+───────────────────────────────────
+
+phy_metrics@40000000 {
+    compatible = "rrc,phy-metrics";
+    reg = <0x40000000 0x10000>;  /* 64KB region */
+    status = "okay";
+};
+
+FOR ARM/DSP PLATFORMS:
+──────────────────────
+
+1. PHY processor writes directly to shared DDR region
+2. Use memory barriers to ensure cache coherency
+3. RRC uses volatile reads to bypass CPU cache
+4. Consider using CMA (Contiguous Memory Allocator) for DMA
+
+MEMORY BARRIERS:
+────────────────
+
+PHY side (after writing metrics):
+  __sync_synchronize();  // GCC memory barrier
+  
+RRC side (before reading):
+  Handled automatically by volatile pointer access in API
+
+═══════════════════════════════════════════════════════════════════════════════
+                        BUILDING AND TESTING
+═══════════════════════════════════════════════════════════════════════════════
+
+BUILD:
+──────
+
+make phy_metrics_simulator     # PHY hardware simulator
+make phy_metrics_test           # Test program for reading metrics
+make rrc_phy_integration_example # RRC integration demo
+
+SIMULATION TESTING:
+───────────────────
+
+Terminal 1 (PHY simulator - simulates hardware):
+$ ./phy_metrics_simulator 3
+
+Terminal 2 (Test metric reading):
+$ sudo ./phy_metrics_test 2
+
+Terminal 3 (RRC integration demo):
+$ ./rrc_phy_integration_example 1
+
+AUTOMATED DEMO:
+───────────────
+
+$ chmod +x run_phy_metrics_demo.sh
+$ ./run_phy_metrics_demo.sh
+
+REAL HARDWARE TESTING:
+──────────────────────
+
+1. Configure PHY to write metrics to 0x40000000 (or your base address)
+2. Ensure PHY updates metrics at 10+ Hz rate
+3. Run as root for /dev/mem access:
+   $ sudo ./phy_metrics_test <neighbor_id> <base_addr_hex>
+   
+Example:
+   $ sudo ./phy_metrics_test 2 0x40000000
+
+═══════════════════════════════════════════════════════════════════════════════
+                         PERFORMANCE CONSIDERATIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+LATENCY:
+────────
+- Single metric read: ~1-2 μs (direct memory access)
+- All 40 neighbors: ~50-80 μs
+- Including score calculation: ~100-150 μs
+
+CACHING:
+────────
+- Metrics mapped with O_SYNC flag to ensure cache coherency
+- volatile keyword forces actual memory reads
+- No CPU cache used for PHY metric region
+
+UPDATE RATES:
+─────────────
+- PHY should update: 10-100 Hz (10-100ms intervals)
+- RRC should read: 1-10 Hz (100ms-1s intervals)
+- Stale data threshold: 500ms (configurable)
+
+MEMORY BANDWIDTH:
+─────────────────
+- Per-neighbor read: 88 bytes
+- 40 neighbors @ 10 Hz: 35.2 KB/s
+- Negligible impact on DDR bandwidth
+
+═══════════════════════════════════════════════════════════════════════════════
+                              TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════════
+
+ERROR: "Failed to open /dev/mem"
+→ Solution: Run as root (sudo) or add CAP_SYS_RAWIO capability
+
+ERROR: "mmap failed"
+→ Check base address is correct for your hardware
+→ Ensure region is not already mapped
+→ Verify /dev/mem is enabled in kernel (CONFIG_DEVMEM)
+
+ERROR: "Stale data" warnings
+→ PHY not updating metrics (check PHY firmware)
+→ Increase stale data threshold if PHY updates slower
+
+ERROR: All metrics read as zero
+→ PHY not writing to expected address
+→ Verify base address configuration
+→ Check PHY firmware is running
+
+═══════════════════════════════════════════════════════════════════════════════
+                              FILES OVERVIEW
+═══════════════════════════════════════════════════════════════════════════════
+
+rrc_phy_metrics.h               - Header with structures, API, inline functions
+phy_metrics_test.c              - Test program to read and display metrics
+phy_metrics_simulator.c         - Simulates PHY writing metrics (for testing)
+rrc_phy_integration_example.c   - Complete RRC integration example
+run_phy_metrics_demo.sh         - Automated demo script
+PHY_METRICS_INTEGRATION.txt     - This documentation
+
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,581 @@
+================================================================================
+RRC COMPLETE WORKFLOW DOCUMENTATION
+Radio Resource Controller - Data Flow and Team API Integration
+================================================================================
+
+OVERVIEW:
+--------
+This document describes the complete workflow of data processing through the 
+RRC layer, showing the integration between Application Layer (L7), OLSR (L3), 
+TDMA/Queue.c (L2), and PHY layers with all external team API calls.
+
+The RRC implements three key extensions:
+1. Piggyback Support in NC Slots
+2. TDMA Slot Status Reporting  
+3. NC Slot Allocation Algorithm
+
+================================================================================
+PART 1: DOWNLINK WORKFLOW (APPLICATION → PHY)
+================================================================================
+
+1.1 APPLICATION LAYER TO RRC ENTRY POINT
+-----------------------------------------
+
+Entry Function: rrc_process_application_packet(const CustomApplicationPacket *packet)
+
+Application Layer sends CustomApplicationPacket structure:
+```
+typedef struct {
+    uint8_t src_id;                    // Source node ID
+    uint8_t dest_id;                   // Destination node ID  
+    RRC_DataType data_type;            // SMS, VOICE, VIDEO, FILE, PTT
+    TransmissionType transmission_type; // UNICAST, MULTICAST, BROADCAST
+    uint8_t data[16];                  // 16-byte payload limit
+    size_t data_size;                  // Actual data size
+    uint32_t sequence_number;          // Packet sequence
+    bool urgent;                       // Priority flag
+} CustomApplicationPacket;
+```
+
+1.2 RRC FSM STATE MANAGEMENT
+----------------------------
+
+RRC FSM States:
+- RRC_STATE_NULL        → System off
+- RRC_STATE_IDLE        → Ready, no active connections
+- RRC_STATE_CONNECTION_SETUP → Establishing radio resources
+- RRC_STATE_CONNECTED   → Active radio connection
+- RRC_STATE_RECONFIGURATION → Handling mobility
+- RRC_STATE_RELEASE     → Releasing resources
+
+State Transitions:
+1. Power On: NULL → IDLE
+2. Data Request: IDLE → CONNECTION_SETUP  
+3. Route/Slots Available: CONNECTION_SETUP → CONNECTED
+4. Route Change: CONNECTED → RECONFIGURATION
+5. Reconfig Success: RECONFIGURATION → CONNECTED
+6. Inactivity: Any → IDLE
+
+1.3 PACKET PROCESSING AND ROUTING
+----------------------------------
+
+Step 1: process_custom_packet(packet)
+- Maps data type to priority queue:
+  * ANALOG_VOICE_PTT → analog_voice_queue
+  * DIGITAL_VOICE → data_queues[0]  
+  * DATA_1 → data_queues[1]
+  * DATA_2 → data_queues[2]
+  * DATA_3 → data_queues[3]
+  * RX_RELAY → rx_queue
+
+Step 2: OLSR Team API Call for Routing
+API Call: uint8_t next_hop = olsr_get_next_hop(dest_node_id)
+- Returns next hop node ID
+- If no route: calls olsr_trigger_route_discovery(dest_node_id)
+
+Step 3: PHY Team API Call for Link Quality
+API Calls:
+- phy_get_link_metrics(node_id, &rssi, &snr, &per)
+- phy_is_link_active(node_id)
+- phy_get_packet_count(node_id)
+
+Quality Thresholds:
+- RSSI > -90 dBm
+- SNR > 10 dB  
+- PER < 50%
+
+1.4 TDMA SLOT ALLOCATION
+------------------------
+
+Step 4: TDMA Team API Call for Slot Availability
+API Call: bool slot_available = tdma_check_slot_available(next_hop_node, priority)
+
+If slots available:
+- Create frame structure from ApplicationMessage
+- Map to appropriate priority queue
+
+Step 5: Queue.c Integration  
+External Queues (from queue.c):
+- analog_voice_queue
+- data_from_l3_queue[4] (priorities 0-3)
+- rx_queue
+- olsr_hello_queue
+
+RRC-Managed Queues:
+- rrc_olsr_nc_queue (for Network Control packets)
+- rrc_relay_queue (for multi-hop data forwarding)
+
+1.5 FRAME CREATION AND ENQUEUING
+---------------------------------
+
+create_frame_from_rrc() converts ApplicationMessage to struct frame:
+```
+struct frame {
+    uint8_t source_add;           // Source node
+    uint8_t dest_add;            // Destination node  
+    uint8_t next_hop_add;        // Next hop from OLSR
+    bool rx_or_l3;               // false for L7 data
+    int TTL;                     // Time to live
+    int priority;                // Queue priority
+    DATATYPE data_type;          // Voice, SMS, Video, etc.
+    char payload[16];            // 16-byte payload
+    int payload_length_bytes;    // Actual length
+};
+```
+
+Final Step: enqueue(queue_ptr, frame) - calls queue.c functions
+
+================================================================================
+PART 2: UPLINK WORKFLOW (PHY → APPLICATION)  
+================================================================================
+
+2.1 UPLINK FRAME RECEPTION
+---------------------------
+
+Entry Function: rrc_process_uplink_frame(struct frame *received_frame)
+
+Frame Classification:
+- rx_or_l3 = true  → OLSR control packet → forward to L3
+- rx_or_l3 = false → Application data → check destination:
+  * For self (dest = node_id) → deliver to L7
+  * For relay (should_relay) → relay queue
+  * Discard (TTL≤1, no route) → drop packet
+
+2.2 OLSR CONTROL PACKET PROCESSING (L3)
+----------------------------------------
+
+Function: forward_olsr_packet_to_l3(struct frame *l3_frame)
+
+For OLSR packets:
+1. Update PHY metrics for source node
+2. Parse neighbor capabilities from hello packets
+3. Forward to OLSR team (external API)
+4. Update neighbor tracking database
+
+Neighbor Capability Parsing:
+```
+OLSR Hello Packet Format:
+Byte 0: Message type (0x01 = HELLO)
+Byte 1: Node ID  
+Byte 2: Reserved
+Byte 3: Capability flags (Bit 0=TX, Bit 1=RX)
+```
+
+2.3 APPLICATION DATA DELIVERY (L7)  
+-----------------------------------
+
+Function: deliver_data_packet_to_l7(struct frame *app_frame)
+
+Steps:
+1. convert_frame_to_app_packet() - converts frame to CustomApplicationPacket
+2. rrc_deliver_to_application_layer() - delivers to application
+3. notify_successful_delivery() - sends confirmation
+
+2.4 PHY METRICS INTEGRATION
+----------------------------
+
+Continuous PHY monitoring:
+- update_phy_metrics_for_node() for each received frame
+- Store metrics in static PHY_LinkMetrics array
+- Use for routing decisions and link quality assessment
+
+================================================================================
+PART 3: RRC EXTENSION 1 - PIGGYBACK SUPPORT
+================================================================================
+
+3.1 PIGGYBACK SYSTEM OVERVIEW
+------------------------------
+
+Purpose: Attach static reservation information to NC (Network Control) slots
+Trigger: START/END packets from Application Layer
+Storage: Static PiggyBackInfo structure
+
+3.2 PIGGYBACK DATA STRUCTURE
+----------------------------
+
+```
+typedef struct {
+    uint8_t node_id;        // Target node for reservation
+    uint8_t session_id;     // Session identifier  
+    uint8_t traffic_type;   // 1=voice, 2=video, 3=data
+    uint8_t source_flag;    // 1=source, 0=relay
+    uint8_t reserved_slot;  // Slot number (1-8)
+    uint8_t ttl;           // Time-to-live in frames
+} PiggyBackInfo;
+```
+
+3.3 PIGGYBACK WORKFLOW
+----------------------
+
+Initialization (START packet):
+1. Application sends packet with data starting "STRT"
+2. rrc_check_start_end_packets() detects START
+3. rrc_initialize_piggyback() activates piggyback
+4. Extract: node_id, session_id, traffic_type, reserved_slot
+
+NC Slot Attachment:
+1. When NC packet is processed (OLSR hello/control)
+2. rrc_should_attach_piggyback() checks if active
+3. rrc_get_piggyback_data() returns current piggyback info
+4. Attach to NC frame before TDMA transmission
+
+Termination (END packet):
+1. Application sends packet with data starting "END"
+2. rrc_clear_piggyback() deactivates piggyback system
+3. TTL management via rrc_update_piggyback_ttl()
+
+================================================================================
+PART 4: RRC EXTENSION 2 - SLOT STATUS REPORTING
+================================================================================
+
+4.1 SLOT STATUS OVERVIEW
+-------------------------
+
+Purpose: Provide TDMA team with current slot allocation status
+Function: rrc_generate_slot_status(SlotStatusInfo slot_status[10])
+Update Frequency: On-demand when TDMA team requests
+
+4.2 SLOT STATUS DATA STRUCTURE
+-------------------------------
+
+```
+typedef struct {
+    uint8_t slot_number;     // Slot ID (0-9)
+    uint8_t usage_status;    // 0=FREE, 1=ALLOCATED, 2=RESERVED, 3=COLLISION
+    uint8_t assigned_node;   // Node using slot (0 if free)
+    uint8_t traffic_type;    // 1=Voice, 2=Video, 3=Data
+    uint8_t priority;        // 1=High, 2=Medium, 3=Low
+} SlotStatusInfo;
+```
+
+4.3 SLOT STATUS GENERATION ALGORITHM
+-------------------------------------
+
+Status Sources:
+1. RRC Connection Pool - active connections and allocated slots
+2. Neighbor Capabilities Database - neighbor slot assignments  
+3. TDMA Slot Table - conflict detection
+4. NC Slots (8,9) - always RESERVED for control
+
+Algorithm:
+1. Initialize all 10 slots as FREE
+2. Scan RRC connection pool for active connections
+3. Mark allocated slots based on connection contexts
+4. Check neighbor database for external allocations
+5. Detect conflicts (multiple nodes in same slot)
+6. Reserve slots 8,9 for NC traffic
+7. Set traffic type and priority based on data type
+
+4.4 USAGE SCENARIOS
+-------------------
+
+TDMA Team Integration:
+- TDMA team calls rrc_generate_slot_status() before scheduling
+- Uses slot status to avoid conflicts
+- Coordinates spatial reuse opportunities
+- Updates slot assignments based on current usage
+
+================================================================================
+PART 5: RRC EXTENSION 3 - NC SLOT ALLOCATION ALGORITHM
+================================================================================
+
+5.1 NC SLOT ALLOCATION OVERVIEW
+--------------------------------
+
+Purpose: Coordinate Network Control slot usage between nodes
+Slots: Dedicated slots 8 and 9 for control traffic
+Algorithm: Round-robin allocation among network nodes
+
+5.2 NC SLOT MANAGEMENT
+----------------------
+
+Static Variables:
+- current_nc_slot: Currently active NC slot (8 or 9)
+- nc_slot_counter: Frame counter for round-robin
+
+Functions:
+- rrc_update_nc_schedule(): Updates slot assignment each frame
+- rrc_is_my_nc_slot(node_id): Checks if node should transmit
+- rrc_get_current_nc_slot(): Returns current NC slot number
+
+5.3 NC SLOT ALLOCATION ALGORITHM
+---------------------------------
+
+Round-Robin Schedule:
+1. Frame counter increments each TDMA frame
+2. Alternate between slots 8 and 9 each frame
+3. Within each slot, assign to nodes based on: (frame_counter % max_nodes) + 1
+4. Node checks rrc_is_my_nc_slot() before NC transmission
+
+Example Schedule (8 nodes):
+```
+Frame 1: Slot 8 → Node 1, Slot 9 → Node 2  
+Frame 2: Slot 8 → Node 3, Slot 9 → Node 4
+Frame 3: Slot 8 → Node 5, Slot 9 → Node 6
+Frame 4: Slot 8 → Node 7, Slot 9 → Node 8
+Frame 5: Slot 8 → Node 1, Slot 9 → Node 2 (repeat)
+```
+
+5.4 NC PACKET PROCESSING
+-------------------------
+
+OLSR Packet to NC Queue:
+1. receive_hello_packet_and_forward_to_tdma() receives OLSR packet
+2. Parse neighbor capabilities
+3. Request NC slot via tdma_request_nc_slot() API call
+4. Enqueue to rrc_olsr_nc_queue with piggyback attachment
+5. TDMA team dequeues via rrc_tdma_dequeue_nc_packet()
+
+================================================================================
+PART 6: RELAY QUEUE SYSTEM (MULTI-HOP DATA FORWARDING)
+================================================================================
+
+6.1 RELAY QUEUE IMPLEMENTATION STATUS
+--------------------------------------
+
+CURRENT IMPLEMENTATION:
+✅ rx_queue (from queue.c) - exists for received frames
+✅ PRIORITY_RX_RELAY mapping defined  
+✅ NC queue processing with relay capability
+✅ rrc_relay_queue - IMPLEMENTED for multi-hop data forwarding
+
+6.2 RELAY INFRASTRUCTURE COMPONENTS
+------------------------------------
+
+Queue Structures:
+- rx_queue: Handles received frames that need forwarding
+- rrc_olsr_nc_queue: NC packets with relay capability
+- rrc_relay_queue: Dedicated multi-hop data forwarding queue
+- Priority mapping: PRIORITY_RX_RELAY = 4 → rx_queue
+
+Relay Processing Functions:
+- init_relay_queue(): Initialize relay queue system
+- enqueue_relay_packet(): Add packet to relay queue with TTL management
+- dequeue_relay_packet(): Remove packet from relay queue
+- should_relay_packet(): Intelligent relay decision logic
+- is_packet_for_self(): Check if packet is destined for current node
+
+6.3 ENHANCED RELAY CAPABILITIES
+-------------------------------
+
+IMPLEMENTED FEATURES:
+✅ Multi-hop data forwarding beyond OLSR control packets
+✅ Intelligent packet classification (self vs relay vs discard)
+✅ TTL management with automatic decrement
+✅ OLSR integration for next-hop determination
+✅ Configurable node ID system
+✅ Comprehensive relay statistics and monitoring
+✅ TDMA team API integration
+
+Enhanced Uplink Processing:
+```
+PHY Received Frame → rrc_process_uplink_frame()
+                                ↓
+                    [Enhanced Decision Tree]
+                                ↓
+┌─────────────────────────────────────────────────┐
+│ OLSR Control (rx_or_l3=true) → NC Queue        │
+│ For Self (dest=node_id)       → Application    │  
+│ For Relay (should_relay)      → Relay Queue    │
+│ Discard (TTL≤1, no route)    → Statistics++    │
+└─────────────────────────────────────────────────┘
+```
+
+Current Relay Capability: COMPLETE multi-hop data forwarding system
+
+6.4 RELAY DECISION ALGORITHM
+-----------------------------
+
+should_relay_packet() Logic:
+```c
+bool should_relay_packet(struct frame *frame) {
+    // Don't relay if packet is for this node
+    if (is_packet_for_self(frame)) return false;
+    
+    // Don't relay if TTL is expired  
+    if (frame->TTL <= 1) return false;
+    
+    // Don't relay OLSR control packets
+    if (frame->rx_or_l3 == true) return false;
+    
+    // Don't relay broadcast packets with high hop count
+    if (frame->dest_add == 0 && frame->TTL < 3) return false;
+    
+    return true;
+}
+```
+
+6.5 TTL MANAGEMENT AND ROUTING
+-------------------------------
+
+Relay Processing Steps:
+1. Receive frame from PHY with TTL = N
+2. Check should_relay_packet() decision
+3. If relay: Decrement TTL (TTL--)
+4. Query OLSR for next hop: olsr_get_next_hop(dest_node)
+5. Update frame->next_hop_add
+6. Enqueue to rrc_relay_queue
+
+TTL Handling:
+- TTL > 1: Packet eligible for relay
+- TTL <= 1: Packet discarded (prevents loops)
+- TTL = 0: Final destination reached
+
+6.6 TDMA INTEGRATION FOR RELAY
+-------------------------------
+
+TDMA Team API Functions:
+- rrc_has_relay_packets(): Check if relay queue has packets
+- rrc_tdma_dequeue_relay_packet(): Get next relay packet for transmission
+
+TDMA Usage Pattern:
+```c
+// TDMA scheduler checks relay queue
+if (rrc_has_relay_packets()) {
+    struct frame relay_packet = rrc_tdma_dequeue_relay_packet();
+    // Schedule transmission via appropriate TDMA slot
+    transmit_frame_via_slot(&relay_packet);
+}
+```
+
+6.7 RELAY STATISTICS AND MONITORING
+------------------------------------
+
+Relay Statistics Counters:
+- relay_packets_received: Total from PHY for processing
+- relay_packets_enqueued: Successfully queued for relay
+- relay_packets_dequeued: Transmitted by TDMA
+- relay_packets_to_self: Delivered to local application
+- relay_packets_discarded: Dropped (TTL, routing, etc.)
+- relay_queue_full_drops: Dropped due to queue full
+
+Monitoring Function:
+```c
+print_relay_stats();  // Detailed relay performance metrics
+```
+
+================================================================================
+PART 7: COMPLETE API INTEGRATION SUMMARY
+================================================================================
+
+7.1 EXTERNAL TEAM API CALLS
+----------------------------
+
+OLSR Team APIs (L3):
+- uint8_t olsr_get_next_hop(uint8_t destination_node_id)
+- void olsr_trigger_route_discovery(uint8_t destination_node_id)
+
+TDMA Team APIs (L2):  
+- bool tdma_check_slot_available(uint8_t next_hop_node, int priority)
+- bool tdma_request_nc_slot(uint8_t *payload, size_t len, uint8_t *assigned_slot)
+
+PHY Team APIs (L1):
+- void phy_get_link_metrics(uint8_t node_id, float *rssi, float *snr, float *per)
+- bool phy_is_link_active(uint8_t node_id)  
+- uint32_t phy_get_packet_count(uint8_t node_id)
+
+Queue.c APIs (L2):
+- void enqueue(struct queue *q, struct frame rx_f)
+- struct frame dequeue(struct queue *q)
+- bool is_empty(struct queue *q)
+- bool is_full(struct queue *q)
+
+7.2 RRC STATIC ALLOCATION POOLS
+-------------------------------
+
+Message Pools:
+- message_pool[16]: Internal RRC message processing
+- app_packet_pool[10]: Application packet notifications
+- connection_pool[8]: FSM connection contexts
+- phy_metrics[32]: PHY link quality storage
+- neighbor_capabilities[32]: Neighbor tracking
+- tdma_slot_table[8]: TDMA slot coordination
+
+Queue Pools:
+- rrc_olsr_nc_queue[10]: Network Control packets
+- rrc_relay_queue[10]: Multi-hop data forwarding
+
+All pools use static allocation - NO malloc/free calls.
+
+7.3 QUEUE INTEGRATION MATRIX
+-----------------------------
+
+Application Data Queues:
+- Analog Voice (PTT) → analog_voice_queue
+- Digital Voice → data_queues[0]
+- Data Priority 1 → data_queues[1]  
+- Data Priority 2 → data_queues[2]
+- Data Priority 3 → data_queues[3]
+- Received Frames → rx_queue
+- OLSR Hello → olsr_hello_queue
+- OLSR NC → rrc_olsr_nc_queue (RRC-managed)
+- Relay Data → rrc_relay_queue (RRC-managed)
+
+================================================================================
+PART 8: WORKFLOW PERFORMANCE CHARACTERISTICS  
+================================================================================
+
+8.1 STATIC ALLOCATION BENEFITS
+-------------------------------
+
+✅ Deterministic Memory Usage: All allocations known at compile time
+✅ No Memory Fragmentation: Static pools prevent heap fragmentation  
+✅ Real-time Performance: No malloc/free latency
+✅ Embedded System Ready: No dynamic allocation dependencies
+✅ Pool Exhaustion Handling: Graceful degradation with error reporting
+
+8.2 PROCESSING LATENCY PROFILE  
+-------------------------------
+
+Downlink Path (App → PHY):
+1. Packet Processing: O(1) - static pool allocation
+2. OLSR Route Lookup: O(1) - external API call
+3. PHY Quality Check: O(n) - linear search in metrics array
+4. TDMA Slot Check: O(1) - external API call  
+5. Frame Creation: O(1) - structure copy
+6. Queue Enqueue: O(1) - queue.c function
+
+Uplink Path (PHY → App):
+1. Frame Classification: O(1) - boolean check
+2. Neighbor Update: O(n) - linear search in neighbor array
+3. Packet Conversion: O(1) - structure conversion
+4. Application Delivery: O(1) - callback/notification
+
+Extension Processing:
+- Piggyback: O(1) - static structure access
+- Slot Status: O(n+m) - scan connections + neighbors  
+- NC Allocation: O(1) - modular arithmetic
+
+8.3 SCALABILITY CHARACTERISTICS
+--------------------------------
+
+Current Pool Limits:
+- 16 concurrent messages in processing
+- 8 active connections  
+- 32 monitored neighbors
+- 32 PHY metric entries
+- 10 application packet notifications
+
+Bottlenecks:
+- Neighbor tracking: O(n) searches
+- PHY metrics: O(n) updates
+- Slot status generation: O(n+m) complexity
+
+Optimization Opportunities:
+- Hash tables for neighbor lookup
+- Timestamp-based metrics aging
+- Cached slot status with dirty flags
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+This document provides a complete workflow description of the RRC implementation
+showing all data paths, external API integrations, and the three extension  
+algorithms. The system provides comprehensive radio resource management with
+static allocation suitable for embedded systems.
+
+For technical details, refer to the source code in rrc1011.c.
+
+Last Updated: December 2, 2025
+Version: 1.0 - Complete Implementation with Extensions

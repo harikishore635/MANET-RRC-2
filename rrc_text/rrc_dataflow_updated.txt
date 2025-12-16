@@ -1,0 +1,208 @@
+RRC Data Flow Summary - Radio Resource Control Implementation
+==============================================================
+
+Application to PHY (Downlink Path):
+-----------------------------------
+1. Application Layer (L7) sends CustomApplicationPacket with src_id, dest_id, data_type, and payload
+2. RRC receives packet via rrc_process_application_packet() and validates 2800 payload limit
+3. RRC maps data_type to MessagePriority (voice=0, data=1-3, PTT=-1) for QoS classification
+4. RRC calls OLSR API olsr_get_next_hop(dest_id) to get routing decision 
+5. RRC creates connection context and transitions FSM state from IDLE→CONNECTION_SETUP→CONNECTED
+6. RRC calls TDMA API tdma_check_slot_available(next_hop, priority) for slot coordination
+7. RRC converts ApplicationMessage to struct frame with source_add, dest_add, next_hop_add fields
+8. RRC enqueues frame to appropriate queue.c priority queue (analog_voice_queue or data_queues[0-3])
+9. RRC updates PHY metrics via phy_get_link_metrics() for link quality assessment
+10. TDMA team dequeues frames from queues and transmits via PHY layer
+11. RRC manages MANET NC slots 8-9 with piggyback TLV for network control information
+12. RRC maintains neighbor state table for multi-hop MANET routing support
+
+PHY to Application (Uplink Path):
+--------------------------------
+13. PHY receives frames and passes to TDMA, which calls rrc_process_uplink_frame()
+14. RRC examines frame.rx_or_l3 flag to determine if packet is L3 (OLSR) or L7 (application data)
+15. For OLSR packets: RRC calls receive_hello_packet_and_forward_to_tdma() for NC queue processing
+16. RRC marks source node as active/TX-capable and forwards hello packet to NC queue for OLSR processing
+17. For application data: RRC checks if frame.dest_add matches rrc_node_id (packet for this node)
+18. If packet is for relay: RRC calls rrc_should_relay() and enqueues to relay queue for forwarding
+19. If packet is local: RRC converts struct frame to CustomApplicationPacket via convert_frame_to_app_packet()
+20. RRC maps frame priority back to RRC_DataType and validates transmission_type
+21. RRC calls rrc_deliver_to_application_layer() to notify application of received packet
+22. RRC updates connection activity timestamps and FSM state for connection management
+23. RRC processes piggyback TLV data from NC slots to update network topology information
+24. RRC maintains PHY metrics (RSSI, SNR, PER) in neighbor_table for link quality decisions
+25. RRC provides pure middle-layer coordination between L7/L3/L2 without implementing algorithms internally
+
+Key RRC Functions:
+-----------------
+- Pure middle layer between Application (L7), OLSR (L3), TDMA (L2), and PHY layers
+- Static allocation only (no malloc/free) with deterministic embedded-friendly design
+- 16-byte payload limit enforcement for all data packets
+- FSM-based connection management with timeout handling
+- MANET waveform support with NC slots 8-9 for network control
+- Neighbor state tracking and capability detection
+- Multi-hop relay packet forwarding support
+- QoS priority mapping and queue coordination
+- Link quality assessment using PHY metrics (RSSI, SNR, PER)
+- API-based integration (calls external OLSR, TDMA, PHY functions)
+
+Optimized Threading & Queue Architecture:
+========================================
+
+Required Message Queues (Total: 8 Queues):
+------------------------------------------
+1. app_to_rrc_queue          - Application→RRC (downlink packets)
+2. rrc_to_app_queue          - RRC→Application (uplink delivery)
+3. olsr_to_rrc_queue         - OLSR→RRC (hello packets, routing updates)
+4. rrc_to_olsr_queue         - RRC→OLSR (topology updates)
+5. tdma_to_rrc_queue         - TDMA→RRC (received frames from PHY)
+6. rrc_relay_queue           - RRC internal (multi-hop forwarding)
+7. rrc_olsr_nc_queue         - RRC internal (NC slot management)
+8. Existing TDMA queues      - analog_voice_queue + data_queues[0-3] + rx_queue
+
+Thread Architecture (3 Optimized Threads):
+------------------------------------------
+Thread 1: Main RRC Processor (Priority 85 - Real-time)
+  • Handles: tdma_to_rrc_queue (uplink frames)
+  • Handles: app_to_rrc_queue (downlink packets)
+  • Handles: rrc_relay_queue (relay forwarding)
+  • Cycle: 500μs (real-time frame processing)
+
+Thread 2: External Team Interface (Priority 70 - High)
+  • Handles: olsr_to_rrc_queue ↔ rrc_to_olsr_queue (OLSR bidirectional)
+  • Handles: rrc_to_app_queue (application delivery)
+  • Cycle: 2ms (network coordination)
+
+Thread 3: Background Management (Priority 50 - Medium)
+  • Handles: NC slot scheduling, piggyback TLV management
+  • Handles: neighbor cleanup, statistics, FSM maintenance
+  • Cycle: 10ms (control functions)
+
+typedef struct {
+    uint8_t src_id;                          // Source node ID
+    uint8_t dest_id;                         // Destination node ID
+    RRC_DataType data_type;                  // Data type for priority mapping
+    TransmissionType transmission_type;       // Unicast/Broadcast/Multicast
+    uint8_t data[PAYLOAD_SIZE_BYTES];        // Actual data payload
+    size_t data_size;                        // Size of data payload
+    uint32_t sequence_number;                // Packet sequence number
+    bool urgent;                             // Urgent/high priority flag
+} CustomApplicationPacket;
+
+typedef struct {
+    uint8_t node_id;
+    uint8_t dest_node_id;
+    RRC_DataType data_type;
+    MessagePriority priority;                // ← MAPPED from data_type
+    TransmissionType transmission_type;
+    uint8_t data[PAYLOAD_SIZE_BYTES];
+    size_t data_size;
+    bool preemption_allowed;                 // ← RRC-SPECIFIC
+    bool in_use;                            // ← POOL MANAGEMENT
+} ApplicationMessage;
+
+struct frame{
+    uint8_t source_add;
+    uint8_t dest_add;
+    uint8_t next_hop_add;
+    bool rx_or_l3;
+    int TTL;
+    int priority;
+    DATATYPE data_type;
+    char payload[PAYLOAD_SIZE_BYTES];
+    int payload_length_bytes;
+};
+
+typedef struct {
+    uint8_t type;                   // TLV type identifier
+    uint8_t length;                 // TLV length
+    uint16_t sourceNodeID;          // Source node ID
+    uint8_t sourceReservations;     // ✅ Source reservations (voice/data)
+    uint8_t relayReservations;      // ✅ Relay reservations (voice/data)
+    uint64_t duGuIntentionMap;      // ✅ 60-bit DU/GU slot intention
+    uint64_t ncStatusBitmap;        // 40-bit NC slot status
+    uint32_t timeSync;              // Time synchronization info
+    uint8_t myNCSlot;              // My assigned NC slot
+    uint8_t ttl;                   // Time-to-live for soft state
+} PiggybackTLV;
+
+typedef struct {
+    uint16_t nodeID;                // Unique neighbor node identifier
+    uint64_t lastHeardTime;         // Last communication timestamp (timeout management)
+    uint8_t txSlots[10];           // Which slots neighbor will transmit in
+    uint8_t rxSlots[10];           // Which slots neighbor expects to receive in
+    PHYMetrics phy;                // Embedded PHY metrics (RSSI, SNR, PER)
+    uint8_t capabilities;          // TX/RX capabilities bitmask (bit 0=TX, bit 1=RX)
+    bool active;                   // Neighbor lifecycle state
+    uint8_t assignedNCSlot;        // MANET NC slot assignment (1-40)
+} NeighborState;
+
+typedef struct {
+    uint64_t ncStatusBitmap;        // 40-bit NC status map (using 64-bit for alignment)
+    uint64_t duGuUsageBitmap;       // 60-bit DU/GU usage forecast
+    uint32_t lastUpdateTime;
+} SlotStatus;
+
+typedef struct {
+    uint8_t slot_id;           // Slot number (0-7)
+    uint8_t assigned_node;     // Node assigned to this slot
+    bool is_tx_slot;           // This is a TX slot
+    bool is_rx_slot;           // This is a RX slot
+    bool is_nc_slot;           // Network Control slot
+    bool collision_detected;   // Potential collision in this slot
+    uint32_t last_update;      // Last update timestamp
+} TDMA_SlotInfo;
+
+typedef struct {
+    uint8_t activeNodes[MAX_MONITORED_NODES];
+    uint8_t activeNodeCount;
+    uint32_t supercycleCounter;
+    uint8_t currentFrame;
+    uint8_t currentSlot;
+    uint8_t myAssignedNCSlot;
+} NCSlotManager;
+
+typedef struct {
+    uint8_t dest_node_id;                    // Destination node for this connection
+    uint8_t next_hop_id;                     // Current next hop via OLSR
+    uint8_t allocated_slots[4];              // TDMA slots allocated for this connection
+    uint32_t connection_start_time;          // When connection was established
+    uint32_t last_activity_time;             // Last packet activity timestamp
+    RRC_SystemState connection_state;        // State of this specific connection
+    MessagePriority qos_priority;            // QoS requirements for this connection
+    bool active;                             // Connection context in use
+    bool setup_pending;                      // Waiting for setup completion
+    bool reconfig_pending;                   // Reconfiguration in progress
+} RRC_ConnectionContext;
+
+typedef struct {
+    uint8_t slot_number;
+    uint8_t usage_status;    // 0=FREE, 1=ALLOCATED, 2=RESERVED, 3=COLLISION
+    uint8_t assigned_node;   // Node currently using the slot (0 if free)
+    uint8_t traffic_type;    // 1=Voice, 2=Video, 3=Data
+    uint8_t priority;        // 1=High, 2=Medium, 3=Low
+} SlotStatusInfo;
+
+typedef struct {
+    float rssi_dbm;
+    float snr_db;
+    float per_percent;
+    uint32_t packet_count;
+    uint32_t last_update_time;
+} PHYMetrics;
+
+
+Difference between customapplicationpacket and applicationmessage:
+
+Application Layer (L7)
+        ↓
+CustomApplicationPacket (External interface)
+        ↓ process_custom_packet()
+ApplicationMessage (Internal RRC processing)
+        ↓ create_frame_from_rrc()  
+struct frame (Queue/TDMA interface)
+        ↓ TDMA/PHY transmission
+struct frame (Received from PHY)
+        ↓ convert_frame_to_app_packet()
+CustomApplicationPacket (Application delivery)
+        ↓
+Application Layer (L7)

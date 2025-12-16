@@ -1,0 +1,252 @@
+═══════════════════════════════════════════════════════════════════════════════
+                        RRC DATA FLOW - SIMPLE QUEUE VIEW
+═══════════════════════════════════════════════════════════════════════════════
+
+SCENARIO: Node 1 sends packet to Node 3 via Node 2 (relay)
+
+═══════════════════════════════════════════════════════════════════════════════
+                              TX PATH (NODE 1)
+═══════════════════════════════════════════════════════════════════════════════
+
+[APP]
+  │
+  │ 1. Write packet to shared memory pool
+  │    SHM: /rrc_app_pool_shm[0] = packet data
+  │
+  ▼ 2. Send notification via queue
+┌─────────────────┐
+│ /rrc_app_to_rrc │ ← AppToRrcMsg(pool_index=0)
+└─────────────────┘
+  │
+  ▼ 3. RRC reads notification
+[RRC]
+  │ 4. Read packet from SHM: /rrc_app_pool_shm[0]
+  │ 5. Need route? Ask OLSR
+  │
+  ▼ 6. Send route request
+┌─────────────────┐
+│ /rrc_rrc_to_olsr│ ← RrcToOlsrMsg(dest=3)
+└─────────────────┘
+  │
+  ▼ 7. OLSR receives
+[OLSR]
+  │ 8. Lookup routing table: dest=3 → next_hop=2
+  │
+  ▼ 9. Send route response
+┌─────────────────┐
+│ /rrc_olsr_to_rrc│ ← OlsrToRrcMsg(next_hop=2, hop_count=2)
+└─────────────────┘
+  │
+  ▼ 10. RRC receives route
+[RRC]
+  │ 11. Allocate NC slot: rrc_assign_nc_slot(2) → slot 5
+  │ 12. Build frame with piggyback TLV
+  │ 13. Write to SHM: /rrc_frame_pool_shm[1] = frame
+  │ 14. Enqueue to priority queue
+  │
+  ▼ 15. Send frame notification
+┌─────────────────┐
+│ /rrc_rrc_to_tdma│ ← RrcToTdmaMsg(pool_index=1, priority=HIGH)
+└─────────────────┘
+  │
+  ▼ 16. TDMA receives
+[TDMA]
+  │ 17. Call RRC APIs: rrc_has_nc_packet_for_slot(5)
+  │ 18. Schedule: DU slot 3 for data, NC slot 5 for hello
+  │ 19. Read frame from SHM: /rrc_frame_pool_shm[1]
+  │
+  ▼ 20. Send to PHY for transmission
+[PHY/MAC]
+  │ 21. Transmit frame via radio
+  │
+  └───────► RF signal to Node 2
+
+═══════════════════════════════════════════════════════════════════════════════
+                              RX PATH (NODE 3)
+═══════════════════════════════════════════════════════════════════════════════
+
+RF signal from Node 2
+  │
+  ▼ 1. PHY receives frame
+[PHY/MAC]
+  │ 2. Store in SHM: /rrc_mac_rx_pool_shm[5] = received frame
+  │ 3. Measure: RSSI=-55dBm, SNR=20dB
+  │
+  ▼ 4. Send RX notification
+┌─────────────────┐
+│ /rrc_mac_to_rrc │ ← MacToRrcMsg(pool_idx=5, rssi=-55, snr=20)
+└─────────────────┘
+  │
+  ▼ 5. RRC receives notification
+[RRC]
+  │ 6. Read frame from SHM: /rrc_mac_rx_pool_shm[5]
+  │ 7. Check destination: dest_id=3 == my_id=3? YES
+  │ 8. Copy to delivery pool: /rrc_frame_pool_shm[2] = frame
+  │ 9. Release MAC RX pool
+  │
+  ▼ 10. Send to application
+┌─────────────────┐
+│ /rrc_rrc_to_app │ ← RrcToAppMsg(pool_idx=2, is_error=0)
+└─────────────────┘
+  │
+  ▼ 11. APP receives notification
+[APP]
+  │ 12. Read frame from SHM: /rrc_frame_pool_shm[2]
+  │ 13. Process: "Received: Hello Node 3"
+  │ 14. Release pool
+  │
+  ▼ Done
+
+═══════════════════════════════════════════════════════════════════════════════
+                            QUEUE SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+Queue Name              Direction       Purpose
+─────────────────────   ─────────────   ─────────────────────────────────────
+/rrc_app_to_rrc_mq      APP → RRC       App submits packets to RRC
+/rrc_rrc_to_app_mq      RRC → APP       RRC delivers frames to App
+/rrc_rrc_to_olsr_mq     RRC → OLSR      RRC requests routes
+/rrc_olsr_to_rrc_mq     OLSR → RRC      OLSR returns routes
+/rrc_rrc_to_tdma_mq     RRC → TDMA      RRC sends frames for scheduling
+/rrc_tdma_to_rrc_mq     TDMA → RRC      TDMA sends hello/NC updates
+/rrc_mac_to_rrc_mq      MAC → RRC       MAC notifies RRC of received frames
+
+═══════════════════════════════════════════════════════════════════════════════
+                         SHARED MEMORY POOLS
+═══════════════════════════════════════════════════════════════════════════════
+
+Pool Name               Size            Purpose
+─────────────────────   ─────────────   ─────────────────────────────────────
+/rrc_app_pool_shm       32 × 3KB        APP writes packets here
+/rrc_frame_pool_shm     64 × 3KB        RRC builds/delivers frames here
+/rrc_mac_rx_pool_shm    64 × 3KB        MAC stores received frames here
+
+═══════════════════════════════════════════════════════════════════════════════
+                            KEY PRINCIPLES
+═══════════════════════════════════════════════════════════════════════════════
+
+1. ZERO-COPY DESIGN
+   - Data written to shared memory once
+   - Queues only carry pool index (4 bytes), not full packet (3KB)
+   - Fast: No memcpy() of large payloads
+
+2. QUEUE MESSAGE PATTERN
+   Step 1: Writer allocates SHM pool entry, writes data
+   Step 2: Writer sends queue message with pool index
+   Step 3: Reader receives queue message
+   Step 4: Reader reads data from SHM using pool index
+   Step 5: Reader releases pool entry when done
+
+3. RRC ACTS AS HUB
+   - RRC receives from: APP, OLSR, TDMA, MAC
+   - RRC sends to: APP, OLSR, TDMA
+   - RRC makes routing decisions based on OLSR + PHY metrics
+
+4. NC SLOT MANAGEMENT
+   - RRC assigns NC slots to neighbors
+   - RRC owns rrc_olsr_nc_queue (for hello messages)
+   - TDMA calls RRC APIs to dequeue NC packets
+
+═══════════════════════════════════════════════════════════════════════════════
+                         SIMPLE EXAMPLES
+═══════════════════════════════════════════════════════════════════════════════
+
+EXAMPLE 1: APP SENDS 1 PACKET
+──────────────────────────────
+
+APP:   Write to /rrc_app_pool_shm[0]
+APP:   Send to /rrc_app_to_rrc_mq → "pool_index=0"
+RRC:   Receive from /rrc_app_to_rrc_mq → got "pool_index=0"
+RRC:   Read from /rrc_app_pool_shm[0] → get packet
+RRC:   Process packet...
+
+EXAMPLE 2: RRC ASKS OLSR FOR ROUTE
+───────────────────────────────────
+
+RRC:   Send to /rrc_rrc_to_olsr_mq → "dest=3"
+OLSR:  Receive from /rrc_rrc_to_olsr_mq → got "dest=3"
+OLSR:  Lookup route: dest=3 → next_hop=2
+OLSR:  Send to /rrc_olsr_to_rrc_mq → "next_hop=2"
+RRC:   Receive from /rrc_olsr_to_rrc_mq → got "next_hop=2"
+
+EXAMPLE 3: RRC SENDS FRAME TO PHY VIA TDMA
+───────────────────────────────────────────
+
+RRC:   Write to /rrc_frame_pool_shm[1] → frame data
+RRC:   Send to /rrc_rrc_to_tdma_mq → "pool_index=1"
+TDMA:  Receive from /rrc_rrc_to_tdma_mq → got "pool_index=1"
+TDMA:  Call rrc_has_nc_packet_for_slot(5) → true
+TDMA:  Schedule frame for DU slot 3
+TDMA:  Read from /rrc_frame_pool_shm[1] → get frame
+PHY:   Transmit frame
+
+EXAMPLE 4: MAC RECEIVES FRAME, DELIVERS TO APP
+───────────────────────────────────────────────
+
+PHY:   Receive frame, measure RSSI/SNR
+MAC:   Write to /rrc_mac_rx_pool_shm[5] → frame data
+MAC:   Send to /rrc_mac_to_rrc_mq → "pool_idx=5, rssi=-55, snr=20"
+RRC:   Receive from /rrc_mac_to_rrc_mq → got "pool_idx=5"
+RRC:   Read from /rrc_mac_rx_pool_shm[5] → get frame
+RRC:   Check: dest_id=3 == my_id? YES → deliver to APP
+RRC:   Write to /rrc_frame_pool_shm[2] → frame data
+RRC:   Send to /rrc_rrc_to_app_mq → "pool_idx=2"
+APP:   Receive from /rrc_rrc_to_app_mq → got "pool_idx=2"
+APP:   Read from /rrc_frame_pool_shm[2] → get frame
+APP:   Display: "Hello Node 3"
+
+═══════════════════════════════════════════════════════════════════════════════
+                          VISUAL SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+                        TX PATH QUEUES
+                        ──────────────
+
+    [APP] ───/rrc_app_to_rrc_mq──→ [RRC]
+                                     │
+                                     │ /rrc_rrc_to_olsr_mq
+                                     ▼
+                                   [OLSR]
+                                     │
+                                     │ /rrc_olsr_to_rrc_mq
+                                     ▼
+                                   [RRC]
+                                     │
+                                     │ /rrc_rrc_to_tdma_mq
+                                     ▼
+                                   [TDMA]
+                                     │
+                                     ▼
+                                [PHY/MAC] → RF
+
+
+                        RX PATH QUEUES
+                        ──────────────
+
+     RF → [PHY/MAC]
+             │
+             │ /rrc_mac_to_rrc_mq
+             ▼
+           [RRC]
+             │
+             │ /rrc_rrc_to_app_mq
+             ▼
+           [APP]
+
+
+                    RRC IS THE CENTRAL HUB
+                    ──────────────────────
+
+                         [OLSR]
+                           ▲ │
+            /rrc_rrc_to_olsr│ │/rrc_olsr_to_rrc
+                           │ ▼
+         [APP] ◄──────── [RRC] ──────────► [TDMA]
+              /rrc_rrc     │ ▲        /rrc_rrc_to_tdma
+               _to_app     │ │         /rrc_tdma_to_rrc
+                           │ │
+                           ▼ │
+                        [PHY/MAC]
+                       /rrc_mac_to_rrc
+
+═══════════════════════════════════════════════════════════════════════════════

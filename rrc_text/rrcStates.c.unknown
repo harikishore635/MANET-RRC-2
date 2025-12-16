@@ -1,0 +1,130 @@
+Add RRC System Management with FSM states to rrc100.c. Keep existing API calls to OLSR/TDMA teams unchanged. Use static allocation only (no malloc).
+
+REQUIRED FSM STATES:
+- RRC_STATE_NULL: Initial state, no RRC context
+- RRC_STATE_IDLE: Registered but no active radio connection  
+- RRC_STATE_CONNECTION_SETUP: Establishing radio resources
+- RRC_STATE_CONNECTED: Active radio connection with allocated slots
+- RRC_STATE_RECONFIGURATION: Handling mobility (route changes)
+- RRC_STATE_RELEASE: Releasing radio resources
+
+REQUIRED ADDITIONS to rrc100.c:
+
+1. FSM State Management:
+```c
+typedef enum {
+    RRC_STATE_NULL = 0,
+    RRC_STATE_IDLE,
+    RRC_STATE_CONNECTION_SETUP, 
+    RRC_STATE_CONNECTED,
+    RRC_STATE_RECONFIGURATION,
+    RRC_STATE_RELEASE
+} RRC_SystemState;
+
+typedef struct {
+    uint8_t dest_node_id;
+    uint8_t next_hop_id;
+    uint8_t allocated_slots[4];
+    uint32_t connection_start_time;
+    uint32_t last_activity_time;
+    bool active;
+} RRC_ConnectionContext;
+
+// Static state variables
+static RRC_SystemState current_rrc_state = RRC_STATE_NULL;
+static RRC_ConnectionContext active_connections[8]; // Static pool
+static uint32_t inactivity_timeout_seconds = 30;
+
+// NULL State Events
+int rrc_handle_power_on(void);                    // NULL → IDLE
+int rrc_handle_power_off(void);                   // IDLE → NULL
+
+// IDLE State Events  
+int rrc_handle_data_request(uint8_t dest_node, MessagePriority qos); // IDLE → CONNECTION_SETUP
+int rrc_handle_upper_layer_data(const CustomApplicationPacket *packet); // Use existing rrc_process_application_packet
+
+// CONNECTION_SETUP State Events
+int rrc_handle_route_response(uint8_t dest_node, uint8_t next_hop);    // Call olsr_get_next_hop
+int rrc_handle_slot_allocation(uint8_t dest_node, uint8_t *slots);     // Call tdma_check_slot_available 
+int rrc_handle_setup_timeout(uint8_t dest_node);                      // Setup failed timeout
+
+// CONNECTED State Events
+int rrc_handle_data_packet_transmission(const CustomApplicationPacket *packet); // Use existing send_to_queue_l2_with_routing_and_phy
+int rrc_handle_route_change(uint8_t dest_node, uint8_t new_next_hop); // Call olsr_trigger_route_discovery
+int rrc_handle_inactivity_timeout(uint8_t dest_node);                 // Auto-release on timeout
+int rrc_handle_release_request(uint8_t dest_node);                    // User-initiated release
+
+// RECONFIGURATION State Events
+int rrc_handle_reconfig_success(uint8_t dest_node, uint8_t new_next_hop, uint8_t *new_slots);
+int rrc_handle_reconfig_failure(uint8_t dest_node);                   // Force release on reconfig failure
+
+// RELEASE State Events  
+int rrc_handle_slots_released(uint8_t dest_node);                     // Call tdma_release_reserved_slot
+int rrc_handle_release_complete(uint8_t dest_node);                   // Clean up connection context
+
+void rrc_transition_to_state(RRC_SystemState new_state, uint8_t dest_node);
+const char* rrc_state_to_string(RRC_SystemState state);
+void rrc_log_state_transition(RRC_SystemState from, RRC_SystemState to, uint8_t dest_node);
+bool rrc_is_state_transition_valid(RRC_SystemState from, RRC_SystemState to);
+
+RRC_ConnectionContext* rrc_get_connection_context(uint8_t dest_node);
+RRC_ConnectionContext* rrc_create_connection_context(uint8_t dest_node);
+void rrc_release_connection_context(uint8_t dest_node);
+void rrc_cleanup_stale_connections(void);
+
+void rrc_periodic_system_management(void);  // Check timeouts, clean up stale connections
+void rrc_check_inactivity_timeouts(void);   // Auto-release inactive connections  
+void rrc_update_connection_activity(uint8_t dest_node); // Update last_activity_time
+
+
+Integration with Existing Functions:
+Modify rrc_process_application_packet() to trigger FSM events
+Modify send_to_queue_l2_with_routing_and_phy() to update connection state
+Add FSM state checks before OLSR/TDMA API calls
+Add connection context updates in routing functions
+
+// TDMA Transmit Control (call existing TDMA APIs)
+int rrc_request_transmit_slot(uint8_t dest_node, MessagePriority priority);
+int rrc_confirm_transmit_slot(uint8_t dest_node, uint8_t slot_id);
+void rrc_release_transmit_slot(uint8_t dest_node, uint8_t slot_id);
+
+// TDMA Receive Control (call existing TDMA APIs) 
+int rrc_setup_receive_slot(uint8_t source_node);
+void rrc_handle_received_frame(struct frame *received_frame);
+void rrc_cleanup_receive_resources(uint8_t source_node);
+
+static struct {
+    uint32_t state_transitions;
+    uint32_t connection_setups;
+    uint32_t connection_releases;
+    uint32_t reconfigurations;
+    uint32_t setup_timeouts;
+    uint32_t inactivity_releases;
+} rrc_fsm_stats = {0};
+
+void print_rrc_fsm_stats(void);
+
+CONSTRAINTS:
+
+Use static allocation only for all state management
+Call existing OLSR APIs (olsr_get_next_hop, olsr_trigger_route_discovery)
+Call existing TDMA APIs (tdma_check_slot_available, tdma_request_nc_slot)
+Keep existing CustomApplicationPacket processing unchanged
+Maintain compatibility with existing queue.c integration
+Add state checks to prevent invalid operations
+Use existing PHY link quality functions for mobility decisions
+INTEGRATION POINTS:
+
+FSM events triggered by existing rrc_process_application_packet()
+State transitions logged with existing printf statements
+Connection contexts updated by existing routing functions
+TDMA slot management through existing external API calls
+Periodic management called from main loop
+EXPECTED BEHAVIOR:
+
+Power on: NULL → IDLE, register with OLSR
+Data request: IDLE → CONNECTION_SETUP, query route + slots
+Resources ready: CONNECTION_SETUP → CONNECTED, start data flow
+Route change: CONNECTED → RECONFIGURATION → CONNECTED
+Data complete: CONNECTED → RELEASE → IDLE
+Failures: Any state → IDLE with proper cleanup
